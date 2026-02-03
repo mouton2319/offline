@@ -1,0 +1,39 @@
+services:
+  gitlab:
+    image: gitlab/gitlab-ee:latest
+    container_name: gitlab
+    hostname: gitlab.local
+    restart: always
+    shm_size: "1024m"
+    ports:
+      - "8081:80"
+      - "8443:443"
+      - "2222:22"
+    environment:
+      GITLAB_OMNIBUS_CONFIG: |
+        external_url 'http://localhost'
+        gitlab_rails['gitlab_port'] = 8081
+        gitlab_rails['gitlab_shell_ssh_port'] = 2222
+        nginx['listen_port'] = 80
+        nginx['listen_https'] = false
+        # 初回起動を少し軽くしたい場合（任意）
+        puma['worker_processes'] = 2
+        puma['min_threads'] = 2
+        puma['max_threads'] = 4
+        sidekiq['max_concurrency'] = 10
+    volumes:
+      - ./gitlab/config:/etc/gitlab
+      - ./gitlab/logs:/var/log/gitlab
+      - ./gitlab/data:/var/opt/gitlab
+
+  runner:
+    image: gitlab/gitlab-runner:latest
+    container_name: gitlab-runner
+    restart: always
+    depends_on:
+      - gitlab
+    volumes:
+      - ./gitlab-runner/config:/etc/gitlab-runner
+      # Docker executor を使うなら必須（runner からホストの Docker を叩く）
+      - /var/run/docker.sock:/var/run/docker.sock
+

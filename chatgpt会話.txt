@@ -1,0 +1,795 @@
+改めて以下の内容をもとに、予測精度として最適なpythonプログラムを作成してください。
+UFO4という人工衛星について、2023年の軌道情報を学習し、2024年のTLEファイルをもとにその後30日分の軌道情報を一分間隔で予測するAIを作成します
+
+2023年の学習データは、UFO4の2023年分のTLEおよび軌道要素の時系列です。
+UFO4の2023年分のTLEファイルは23467_2023というディレクトリにあります。軌道要素の時系列は、2023_calc_az_el.csvというファイルにあります。
+2024年のTLEファイルは、23467_2024というディレクトリにあります。学習時には一切使用せず、推論時に一つだけ与えることで、与えたTLEファイルから30日間の軌道情報（AZ, ELなど）を一分間隔で予測してcsvファイルに出力したいです。
+ただし、そもそも単一TLEからのSGP4計算結果の精度がよく、上記のような方法ではうまくいかなかったため、上記を最終目標とし、以下のような方針で正確な予測ができるように目指します。なお、対象の人工衛星は全てGEOであることを前提とします。
+・2023年の各TLEから、30日分の軌道情報を一分間隔で計算した結果を作成（この結果は23467_2023_csvディレクトリに存在します。TLE名と同じ名前のcsvファイルが、対応するcsvファイルです。）
+・上記のように作成したcsvファイルと、真値のcsvファイル（2023_calc_az_el.csv）との、対応する同時刻の各軌道情報の誤差を計算し、計算結果を別のcsvに記録（この結果は23467_2023_errorディレクトリに存在します。TLE名と同じ名前のcsvファイルが、対応するcsvファイルです。今後、このファイルを誤差ファイルと呼びます。）
+・誤差ファイルにはすべてNo列として1から番号が振られている。一つのTLEから軌道を計算した際の、真値からのずれは、同じ人工衛星ならどのTLEでも大きく変わらないという仮定の下、Noごとの誤差の大きさと対応するTLEファイルの各値のみを学習する。（2023-11-10_11-38-15.csvのNo.10000の誤差の値と、2023-05-27_09-49-42.csvのNo.10000の誤差の値はあまり変わらないといった仮定。）
+・推論時には、推論対象となるTLEファイルから30日分一分ごとの軌道情報を計算し、推論した誤差を足し合わせて補正をかけ、真値に近づけるようにする。
+・2024年の各TLEから、30日分の軌道情報を一分間隔で計算した結果はすでに23467_2024フォルダに存在するため、推論対象のTLEに対応するcsvファイルと、対応する真値のデータおよび推論して補正をかけた結果をグラフに表示し、どのくらい改善したかを視覚的に表示できるようにする。MSE, RMSEの値も表示する。
+また、実行時にはこれまで、docker環境を使用して以下のようなコマンドで実行していました。
+docker run --rm -it --gpus all -v "$PWD":/work -w /work orbit-tf-pip:cuda128 bash -lc python3.11 orbit_error_ai_ecef.py predict --model orbit_error_model_ecef --tle-file 28628_2024/2024-03-03-01-41-42.txt --baseline-csv 28628_2024_csv/2024-03-03-01-41-42.csv --out-corrected-csv 28628_2024_corrected/2024-03-03-01-41-42.csv --out-pred-delta-csv 28628_2024_corrected/2024-03-03-01-41-42_pred_delta.csv --days 30 --step-minutes 1 --overwrite'
+
+docker run --rm -it --gpus all -v "$PWD":/work -w /work orbit-tf-pip:cuda128 bash -lc 'python3.11 orbit_error_ai_ecef.py train --tle-dir 28628_2023 --pred-dir 28628_2023_csv --err-dir 28628_2023_error --truth-csv 2023_calc_az_el.csv --out-model orbit_error_model_ecef_v4 --days-horizon 30 --epochs 400 --batch-size 512 --early-stop-patience 20 --overwrite --y-centering zero --time-weight-power 2.0'
+
+
+[SCALER] 400/469 files, rows=17279755
+[SCALER] 425/469 files, rows=18336284
+[SCALER] 450/469 files, rows=18973739
+WARNING: All log messages before absl::InitializeLog() is called are written to STDERR
+W0000 00:00:1771800312.970264       1 gpu_device.cc:2459] TensorFlow was not built with CUDA kernel binaries compatible with compute capability 12.0a. CUDA kernels will be jit-compiled from PTX, which could take 30 minutes or longer.
+W0000 00:00:1771800312.972504       1 gpu_device.cc:2459] TensorFlow was not built with CUDA kernel binaries compatible with compute capability 12.0a. CUDA kernels will be jit-compiled from PTX, which could take 30 minutes or longer.
+Traceback (most recent call last):
+  File "/work/orbit_error_ai_ecef.py", line 1606, in <module>
+    raise SystemExit(main())
+                     ^^^^^^
+  File "/work/orbit_error_ai_ecef.py", line 1599, in main
+    return train_model(args)
+           ^^^^^^^^^^^^^^^^^
+  File "/work/orbit_error_ai_ecef.py", line 1116, in train_model
+    model = build_mlp_model(input_dim, dt_idx, hidden=hidden, l2=args.l2, dropout=args.dropout)
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/work/orbit_error_ai_ecef.py", line 544, in build_mlp_model
+    y_out = tf.concat([mean, logvar], axis=1)
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.11/dist-packages/tensorflow/python/util/traceback_utils.py", line 153, in error_handler
+    raise e.with_traceback(filtered_tb) from None
+  File "/usr/local/lib/python3.11/dist-packages/keras/src/backend/common/keras_tensor.py", line 194, in __tf_tensor__
+    raise ValueError(
+ValueError: A KerasTensor cannot be used as input to a TensorFlow function. A KerasTensor is a symbolic placeholder for a shape and dtype, used when constructing Keras Functional models or Keras Functions. You can only use it as input to a Keras layer or a Keras operation (from the namespaces `keras.layers` and `keras.ops`). You are likely doing something like:
+
+```
+
+x = Input(...)
+
+...
+
+tf\_fn(x)  # Invalid.
+
+```
+
+What you should do instead is wrap `tf\_fn` in a layer:
+
+```
+
+class MyLayer(Layer):
+
+&nbsp;   def call(self, x):
+
+&nbsp;       return tf\_fn(x)
+
+
+
+x = MyLayer()(x)
+
+```
+
+
+docker run --rm -it --gpus all -v "$PWD":/work -w /work orbit-tf-pip:cuda128 bash -lc 'python3.11 orbit_error_ai_no_tle_tf.py train --tle-dir 23467_2023 --err-dir 23467_2023_error --out-model orbit_error_model_no_tle_tf_v1 --days-horizon 30 --step-minutes 1 --sample-every 1 --hidden 512,512,256,128 --epochs 400 --batch-size 512 --lr 1e-3 --time-weight-power 2.0 --clip-grid 0,2,3,4,6,8 --overwrite'
+
+docker run --rm -it --gpus all -v "$PWD":/work -w /work orbit-tf-pip:cuda128 bash -lc 'python3.11 orbit_error_ai_no_tle_tf.py predict --model orbit_error_model_no_tle_tf_v1 --tle-file 23467_2024/2024-03-01_15-44-37.txt --baseline-csv 23467_2024_csv/2024-03-01_15-44-37.csv --out-corrected-csv 23467_2024_corrected/2024-03-01_15-44-37.csv --out-pred-error-csv 23467_2024_corrected/2024-03-01_15-44-37_pred_error.csv --truth-csv 2024_calc_az_el.csv --plot-dir 23467_2024_corrected/plots --days 30 --step-minutes 1 --overwrite'
+
+docker run --rm -it --gpus all -v "$PWD":/work -w /work orbit-tf-pip:cuda128 bash -lc 'python3.11 orbit_error_ai_no_tle_tf.py train --tle-dir 23467_2023 --err-dir 23467_2023_error --out-model orbit_error_model_no_tle_tf_v2 --days-horizon 30 --step-minutes 1 --epochs 400 --batch-size 512 --time-weight-power 2.0 --early-stop-objective azel --alpha-max 1.0 --alpha-max-azel 0.5 --alpha-grid-step 0.02 --min-improve-pct 1.0 --azel-alpha-shrink 0.8 --azel-cap-deg 0.02 --clip-grid 0,0.5,1,1.5,2 --overwrite'
+
+docker run --rm -it --gpus all -v "$PWD":/work -w /work orbit-tf-pip:cuda128 bash -lc 'python3.11 orbit_error_ai_no_tle_tf.py predict --model orbit_error_model_no_tle_tf_v2 --tle-file 23467_2024/2024-03-01_15-44-37.txt --baseline-csv 23467_2024_csv/2024-03-01_15-44-37.csv --out-corrected-csv 23467_2024_corrected/2024-03-01_15-44-37.csv --out-pred-error-csv 23467_2024_corrected/2024-03-01_15-44-37_pred_error.csv --truth-csv 2024_calc_az_el.csv --plot-dir 23467_2024_corrected/plots --azel-cap-deg 0.02 --overwrite'
+
+docker run --rm -it --gpus all -v "$PWD":/work -w /work orbit-tf-pip:cuda128 bash -lc 'python3.11 orbit_error_ai_no_tle_tf.py train --tle-dir 23467_2023 --err-dir 23467_2023_error --out-model orbit_error_model_no_tle_tf_v2 --days-horizon 30 --step-minutes 1 --epochs 400 --batch-size 512 --time-weight-power 2.0 --early-stop-objective azel --alpha-max 1.0 --alpha-max-azel 0.3 --alpha-grid-step 0.02 --min-improve-pct 1.0 --azel-alpha-shrink 0.8 --azel-cap-deg 0.02 --clip-grid 0,0.5,1,1.5,2 --overwrite'
+
+docker run --rm -it --gpus all -v "$PWD":/work -w /work orbit-tf-pip:cuda128 bash -lc 'python3.11 orbit_error_ai_no_tle_tf.py train --tle-dir 23467_2023 --err-dir 23467_2023_error --out-model orbit_error_model_no_tle_tf_v2 --days-horizon 30 --step-minutes 1 --epochs 400 --batch-size 512 --time-weight-power 2.0 --early-stop-objective azel --alpha-max 1.0 --alpha-max-azel 0.3 --alpha-grid-step 0.02 --min-improve-pct 1.0 --azel-alpha-shrink 0.8 --azel-cap-deg 0.01 --clip-grid 0,0.5,1,1.5,2 --overwrite'
+
+docker run --rm -it --gpus all -v "$PWD":/work -w /work orbit-tf-pip:cuda128 bash -lc 'python3.11 orbit_error_ai_no_tle_tf.py train --tle-dir 23467_2023 --err-dir 23467_2023_error --out-model orbit_error_model_no_tle_tf_v2 --days-horizon 30 --step-minutes 1 --epochs 400 --batch-size 512 --time-weight-power 2.0 --early-stop-objective azel --alpha-max 1.0 --alpha-max-azel 0.3 --alpha-grid-step 0.02 --min-improve-pct 2.0 --azel-alpha-shrink 0.8 --azel-cap-deg 0.01 --clip-grid 0,0.5,1,1.5,2 --overwrite'
+
+学習時に
+docker run --rm -it --gpus all -v "$PWD":/work -w /work orbit-tf-pip:cuda128 \
+  bash -lc 'python3.11 orbit_error_ai_no_tle_tf.py train \
+    --tle-dir 23467_2023 \
+    --err-dir 23467_2023_error \
+    --out-model orbit_error_model_no_tle_tf_v2 \
+    --days-horizon 30 --step-minutes 1 \
+    --epochs 400 --batch-size 512 \
+    --time-weight-power 2.0 \
+    --early-stop-objective azel \
+    --alpha-max 1.0 \
+    --alpha-max-azel 0.5 \
+    --alpha-grid-step 0.02 \
+    --min-improve-pct 1.0 \
+    --azel-alpha-shrink 0.8 \
+    --azel-cap-deg 0.02 \
+    --clip-grid 0,0.5,1,1.5,2 \
+    --overwrite'
+というコマンドで学習し、その後
+docker run --rm -it --gpus all -v "$PWD":/work -w /work orbit-tf-pip:cuda128 \
+  bash -lc 'python3.11 orbit_error_ai_no_tle_tf.py predict \
+    --model orbit_error_model_no_tle_tf_v2 \
+    --tle-file 23467_2024/2024-03-01_15-44-37.txt \
+    --baseline-csv 23467_2024_csv/2024-03-01_15-44-37.csv \
+    --out-corrected-csv 23467_2024_corrected/2024-03-01_15-44-37.csv \
+    --out-pred-error-csv 23467_2024_corrected/2024-03-01_15-44-37_pred_error.csv \
+    --truth-csv 2024_calc_az_el.csv \
+    --plot-dir 23467_2024_corrected/plots \
+    --azel-cap-deg 0.02 \
+    --overwrite'
+で推論した結果を23467_2024_corrected_1ディレクトリに保存しています。
+また、学習時に--alpha-max-azel 0.3を指定した後に推論した結果を23467_2024_corrected_alpha0.3ディレクトリに保存しています。
+また、学習時に--alpha-max-azel 0.3、--azel-cap-deg 0.01を指定した後に、推論時に--azel-cap-deg 0.01を指定した結果を23467_2024_corrected_0.01ディレクトリに保存しています。
+また、学習時に--alpha-max-azel 0.3、--azel-cap-deg 0.01、--min-improve-pct 2.0を指定した後に、推論時に--azel-cap-deg 0.01を指定した結果を23467_2024_corrected_2.0ディレクトリに保存しています。
+これを見ると、多少はAZ, ELの結果もよくなっているように見えますが、Altに比べれば単体TLEのSGP4計算結果がそもそもいいこともあり、あまり大きく予測結果が改善しているようには見えません。また、23467_2024_corrected_2.0ディレクトリの結果に至っては、もはや推論結果と単体TLEのSGP4計算結果が全く同じになっているように見えます。
+以上の結果をもとに、推論結果のほうが単体TLEのSGP4計算結果よりもよくなるようにより深く考えてpythonプログラムを作成してください。
+
+docker run --rm --gpus all -v "$PWD":/work -w /work orbit-tf-pip:cuda128 bash -lc 'python3.11 orbit_error_ai_no_tle_tf.py train --tle-dir 23467_2023 --err-dir 23467_2023_error --out-model orbit_error_model_no_tle_tf_azel_best --days-horizon 30 --step-minutes 1 --epochs 400 --batch-size 512 --time-weight-power 2.0 --early-stop-objective azel --alpha-max 1.0 --alpha-max-az 0.30 --alpha-max-el 0.05 --alpha-grid-step 0.02 --min-improve-pct 1.5 --azel-alpha-shrink 0.6 --azel-cap-deg 0.008 --clip-grid 0,0.5,1 --overwrite'
+
+docker run --rm --gpus all -v "$PWD":/work -w /work orbit-tf-pip:cuda128 bash -lc 'python3.11 orbit_error_ai_no_tle_tf.py predict --model orbit_error_model_no_tle_tf_azel_best --tle-file 23467_2024/2024-03-01_15-44-37.txt --baseline-csv 23467_2024_csv/2024-03-01_15-44-37.csv --out-corrected-csv 23467_2024_corrected/2024-03-01_15-44-37.csv --out-pred-error-csv 23467_2024_corrected/2024-03-01_15-44-37_pred_error.csv --truth-csv 2024_calc_az_el.csv --plot-dir 23467_2024_corrected/plots --azel-cap-deg 0.008 --overwrite'
+
+実際にorbit_error_ai_no_tle_tf.pyで学習、推論した結果がディレクトリ23467_2024_correctedにあります。これを見ると、Alt以外ほとんど改善が見られず、単一TLEからのSGP4計算結果とほとんど同じになっています。
+私はこの原因として、あるTLEのずれは正の方向にずれ、別のTLEは負の方向にずれてしまい、平均化されて補正すべきずれがほぼ0になってしまっているのではないかと推測しています。この推測があっているか確認し、あっている場合は、学習前にずれの絶対値をとって、ずれの幅のみを学習して推論するようにし、補正をかけるときには推論した結果をbaselineに足したものと引いたもの両方を作成し、それぞれに対する改善度合いを計測するようにしてください。
+この推測が間違っている場合は、誤差の予測結果を今より良くするためのロジックを深く考えて、AI作成用のpythonプログラムを再度作成してください。
+
+docker run --rm -it --gpus all -v "$PWD":/work -w /work orbit-tf-pip:cuda128 bash -lc 'python3.11 orbit_error_ai_no_tle_tf.py train --tle-dir 23467_2023 --err-dir 23467_2023_error --out-model orbit_error_model_no_tle_tf_v5 --error-repr auto --repr-auto-threshold 0.35 --days-horizon 30 --step-minutes 1 --epochs 400 --batch-size 512 --time-weight-power 2.0 --early-stop-objective azel --alpha-max 1.0 --alpha-max-azel 0.3 --alpha-grid-step 0.02 --min-improve-pct 1.0 --azel-alpha-shrink 0.8 --azel-cap-deg 0.01 --clip-grid 0,0.5,1,1.5,2 --overwrite'
+
+docker run --rm -it --gpus all -v "$PWD":/work -w /work orbit-tf-pip:cuda128 bash -lc 'python3.11 orbit_error_ai_no_tle_tf.py predict --model orbit_error_model_no_tle_tf_v5 --tle-file 23467_2024/2024-03-01_15-44-37.txt --baseline-csv 23467_2024_csv/2024-03-01_15-44-37.csv --out-corrected-csv 23467_2024_corrected/2024-03-01_15-44-37.csv --out-pred-error-csv 23467_2024_corrected/2024-03-01_15-44-37_pred_error.csv --truth-csv 2024_calc_az_el.csv --plot-dir 23467_2024_corrected/plots --branch-select best_azel --azel-cap-deg 0.01 --overwrite'
+
+実際にorbit_error_ai_no_tle_tf.pyで学習、推論した結果がディレクトリ23467_2024_correctedにあります。これを見ると、やはり今までの結果と変わらず、Alt以外ほとんど改善が見られず、単一TLEからのSGP4計算結果とほとんど同じになっています。
+誤差の予測結果を今より良くするためのロジックを再度深く考えて、AI作成用のpythonプログラムを再度作成してください。
+
+docker run --rm -it --gpus all -v "$PWD":/work -w /work orbit-tf-pip:cuda128 bash -lc 'python3.11 orbit_error_ai_no_tle_tf.py train --tle-dir 23467_2023 --err-dir 23467_2023_error --pred-dir 23467_2023_csv --out-model orbit_error_model_no_tle_tf_v6 --days-horizon 30 --step-minutes 1 --epochs 400 --batch-size 512 --time-weight-power 2.0 --early-stop-objective azel --loss-weight-az 3.0 --loss-weight-el 3.0 --loss-weight-lat 1.0 --loss-weight-lon 1.0 --loss-weight-alt 1.0 --error-repr auto --repr-auto-threshold 0.35 --alpha-max 1.0 --alpha-max-azel 0.5 --alpha-grid-step 0.02 --min-improve-pct 0.5 --azel-alpha-shrink 0.9 --azel-cap-deg 0.02 --clip-grid 0,0.5,1,1.5,2 --overwrite'
+
+docker run --rm -it --gpus all -v "$PWD":/work -w /work orbit-tf-pip:cuda128 bash -lc 'python3.11 orbit_error_ai_no_tle_tf.py predict --model orbit_error_model_no_tle_tf_v6 --tle-file 23467_2024/2024-03-01_15-44-37.txt --baseline-csv 23467_2024_csv/2024-03-01_15-44-37.csv --out-corrected-csv 23467_2024_corrected/2024-03-01_15-44-37.csv --out-pred-error-csv 23467_2024_corrected/2024-03-01_15-44-37_pred_error.csv --truth-csv 2024_calc_az_el.csv --plot-dir 23467_2024_corrected/plots --branch-select best_azel --azel-cap-deg 0.02 --overwrite'
+
+orbit_error_ai_no_tle_tf.pyを使用した学習時のログを以下に示します。
+[EPOCH 61/400] train_loss=0.0531933 rows=19128042
+  [VAL raw] AZEL_RMSE_mean 0.187768 -> 0.0887915
+[EARLY STOP] no improve for 15 epochs. best_epoch=46 best_score=0.0721984
+[INFO] calibrated alpha vec (Lat,Lon,Alt,AZ,EL): 1, 1, 0.92, 0.45, 0.45
+[INFO] calibrated clip vec (Lat,Lon,Alt,AZ,EL): none, none, none, none, none
+[CALIB:Lat] RMSE 0.0282387 -> 0.0120516 (improve 57.322%), alpha=1, clip=none
+[CALIB:Lon] RMSE 0.215893 -> 0.0816766 (improve 62.168%), alpha=1, clip=none
+[CALIB:Alt] RMSE 3.34527 -> 1.33067 (improve 60.222%), alpha=0.92, clip=none
+[CALIB:AZ] RMSE 0.227301 -> 0.218184 (improve 4.011%), alpha=0.45, clip=none
+[CALIB:EL] RMSE 0.148236 -> 0.13936 (improve 5.988%), alpha=0.45, clip=none
+
+学習した結果をもとに推論した結果は23467_2024_correctedディレクトリに存在します。推論時のログは以下です。
+[SAVED] baseline-vs-corrected plots: 23467_2024_corrected/plots
+[SAVED] metrics: 23467_2024_corrected/2024-03-01_15-44-37_metrics.csv
+[METRIC] branch compare (baseline -> corrected_minus / corrected_plus / corrected[selected])
+  GLOBAL RMSE: 1.4065 -> 0.537709 / 0.537715 / 0.537709
+  AZEL  RMSE: 0.0177144 -> 0.0199869 / 0.0199869 / 0.0199869
+[METRIC] MSE/RMSE (baseline -> corrected[selected])
+  Lat: MSE 8.01213e-06 -> 4.94019e-05 | RMSE 0.00283057 -> 0.00702865
+  Lon: MSE 0.00041784 -> 0.00426669 | RMSE 0.0204411 -> 0.0653199
+  Alt: MSE 9.89014 -> 1.44051 | RMSE 3.14486 -> 1.20021
+  AZ: MSE 0.000487588 -> 0.000561452 | RMSE 0.0220814 -> 0.023695
+  EL: MSE 0.000178153 -> 0.000265001 | RMSE 0.0133474 -> 0.0162789
+  GLOBAL: MSE 1.97825 -> 0.289131 | RMSE 1.4065 -> 0.537709
+[SAVED] truth comparison plots: 23467_2024_corrected/plots
+
+これをもとに、そもそも誤差を予測して補正する方法が、AZ, ELの予測の正確性として適切かを含めて深く考え、改めて適切な予測AI作成プログラムを、軌道計算及びAIエンジニアのプロフェッショナルとして深く考えて作成してください。
+
+docker run --rm -it --gpus all -v "$PWD":/work -w /work orbit-tf-pip:cuda128 bash -lc 'python3.11 orbit_error_ai_no_tle_tf.py train --tle-dir 23467_2023 --err-dir 23467_2023_error --pred-dir 23467_2023_csv --out-model orbit_error_model_no_tle_tf_v7 --days-horizon 30 --step-minutes 1 --epochs 400 --batch-size 512 --time-weight-power 2.0 --early-stop-objective azel --loss-weight-az 4.0 --loss-weight-el 4.0 --loss-weight-lat 1.0 --loss-weight-lon 1.0 --loss-weight-alt 1.0 --error-repr auto --repr-auto-threshold 0.35 --alpha-max 1.0 --alpha-max-azel 0.35 --alpha-grid-step 0.02 --min-improve-pct 2.0 --calib-trim-quantile-azel 0.7 --alpha-schedule-days 0,1,3,7,14,30 --alpha-schedule-targets AZ,EL --alpha-schedule-min-rows 3000 --azel-alpha-shrink 0.7 --azel-cap-deg 0.01 --clip-grid 0,0.5,1,1.5,2 --overwrite'
+
+docker run --rm -it --gpus all -v "$PWD":/work -w /work orbit-tf-pip:cuda128 bash -lc 'python3.11 orbit_error_ai_no_tle_tf.py predict --model orbit_error_model_no_tle_tf_v7 --tle-file 23467_2024/2024-03-01_15-44-37.txt --baseline-csv 23467_2024_csv/2024-03-01_15-44-37.csv --out-corrected-csv 23467_2024_corrected/2024-03-01_15-44-37.csv --out-pred-error-csv 23467_2024_corrected/2024-03-01_15-44-37_pred_error.csv --truth-csv 2024_calc_az_el.csv --plot-dir 23467_2024_corrected/plots --branch-select best_azel --azel-cap-deg 0.01 --overwrite'
+
+orbit_error_ai_no_tle_tf.pyを使用した学習時のログを以下に示します。
+[EPOCH 61/400] train_loss=0.060178 rows=19128042
+  [VAL raw] AZEL_RMSE_mean 0.187768 -> 0.0889554
+[EARLY STOP] no improve for 15 epochs. best_epoch=46 best_score=0.0727847
+[INFO] calibrated alpha vec (Lat,Lon,Alt,AZ,EL): 1, 1, 0.9, 0.238, 0.238
+[INFO] calibrated clip vec (Lat,Lon,Alt,AZ,EL): none, none, none, none, none
+[CALIB:Lat] RMSE 0.0282387 -> 0.0118076 (improve 58.187%), alpha=1, clip=none
+[CALIB:Lon] RMSE 0.215893 -> 0.0828857 (improve 61.608%), alpha=1, clip=none
+[CALIB:Alt] RMSE 3.34527 -> 1.28436 (improve 61.607%), alpha=0.9, clip=none
+[CALIB:AZ] RMSE 0.0225348 -> 0.0202973 (improve 9.929%), alpha=0.238, clip=none
+[CALIB:EL] RMSE 0.0152491 -> 0.013308 (improve 12.730%), alpha=0.238, clip=none
+[INFO] alpha schedule days: 0,1,3,7,14,30
+[SCHED:AZ] 0, 0, 0, 0.34, 0.34
+[SCHED:EL] 0, 0, 0, 0.34, 0.34
+[TRAIN] global RMSE 1.44613 -> 0.507869 (64.881%)
+[VAL] global RMSE 1.50412 -> 0.587685 (60.928%)
+  Lat: RMSE 0.0282387 -> 0.0118076
+  Lon: RMSE 0.215893 -> 0.0828857
+  Alt: RMSE 3.34527 -> 1.28436
+  AZ: RMSE 0.227301 -> 0.222739
+  EL: RMSE 0.148236 -> 0.143763
+[SAVED] model: orbit_error_model_no_tle_tf_v7/model.keras
+[SAVED] meta: orbit_error_model_no_tle_tf_v7/meta.json
+[SAVED] train summary: orbit_error_model_no_tle_tf_v7/train_summary.json
+
+学習した結果をもとに推論した結果は23467_2024_correctedディレクトリに存在します。推論時のログは以下です。
+[METRIC] branch compare (baseline -> corrected_minus / corrected_plus / corrected[selected])
+  GLOBAL RMSE: 1.4065 -> 0.769977 / 0.76998 / 0.769977
+  AZEL  RMSE: 0.0177144 -> 0.0189391 / 0.0189391 / 0.0189391
+[METRIC] MSE/RMSE (baseline -> corrected[selected])
+  Lat: MSE 8.01213e-06 -> 8.03515e-05 | RMSE 0.00283057 -> 0.0089639
+  Lon: MSE 0.00041784 -> 0.00530525 | RMSE 0.0204411 -> 0.0728371
+  Alt: MSE 9.89014 -> 2.95819 | RMSE 3.14486 -> 1.71994
+  AZ: MSE 0.000487588 -> 0.000519762 | RMSE 0.0220814 -> 0.0227983
+  EL: MSE 0.000178153 -> 0.000227405 | RMSE 0.0133474 -> 0.01508
+  GLOBAL: MSE 1.97825 -> 0.592864 | RMSE 1.4065 -> 0.769977
+[SAVED] truth comparison plots: 23467_2024_corrected/plots
+
+これをみると、学習時のAZ, ELはほとんど変化せず、予測時のAZ, ELは悪化しているように見えます。改めて適切な予測AI作成プログラムを、軌道計算及びAIエンジニアのプロフェッショナルとして深く考えて作成してください。
+
+
+docker run --rm -it --gpus all -v "$PWD":/work -w /work orbit-tf-pip:cuda128 \
+  bash -lc 'python3.11 orbit_error_ai_no_tle_tf.py train \
+    --tle-dir 23467_2023 \
+    --err-dir 23467_2023_error \
+    --pred-dir 23467_2023_csv \
+    --out-model orbit_error_model_no_tle_tf_v8 \
+    --days-horizon 30 --step-minutes 1 --sample-every 1 \
+    --split-mode time --val-split 0.15 \
+    --epochs 400 --batch-size 512 \
+    --time-weight-power 2.0 \
+    --early-stop-objective azel --early-stop-patience 20 \
+    --loss-weight-az 3.0 --loss-weight-el 3.0 \
+    --alpha-max 1.0 --alpha-max-azel 0.35 --alpha-grid-step 0.02 \
+    --min-improve-pct 0.5 \
+    --calib-trim-quantile-azel 0.8 \
+    --alpha-schedule-days 0,1,3,7,14,30 \
+    --alpha-schedule-targets AZ,EL \
+    --gate-targets AZ,EL \
+    --gate-quantiles 0,0.5,0.8,0.95,1.0 \
+    --gate-min-improve-pct 0.5 \
+    --final-azel-guard-min-improve-pct 0.2 \
+    --azel-alpha-shrink 0.85 \
+    --azel-cap-deg 0.02 \
+    --clip-grid 0,0.5,1,1.5,2 \
+    --overwrite'
+
+学習した結果をもとに推論した結果は23467_2024_correctedディレクトリに存在します。これをみると、やはりあまり改善していないように感じます。今までは誤差を予測して補正をかけるようにしていましたが、逆に真値である2023_calc_az_el.csvの値と、23467_2023ディレクトリにある、2023年中のTLEファイルをそのまま学習し、推測時には、与えられた2024年のあるTLEをもとにそこから30日間、一分ごとの軌道情報を予測するようにしたら、誤差の補正を行う方針より、よい予測値になりますか？改めて適切な予測AI作成プログラムを、軌道計算及びAIエンジニアのプロフェッショナルとして深く考えて作成してください。
+
+docker run --rm -it --gpus all -v "$PWD":/work -w /work orbit-tf-pip:cuda128 \
+  bash -lc 'python3.11 orbit_hybrid_direct_tf.py predict \
+    --model orbit_hybrid_direct_model_v1 \
+    --tle-file 23467_2024/2024-03-01_15-44-37.txt \
+    --baseline-csv 23467_2024_csv/2024-03-01_15-44-37.csv \
+    --out-corrected-csv 23467_2024_corrected_hybrid/2024-03-01_15-44-37.csv \
+    --out-pred-csv 23467_2024_corrected_hybrid/2024-03-01_15-44-37_pred.csv \
+    --truth-csv 2024_calc_az_el.csv \
+    --plot-dir 23467_2024_corrected_hybrid/plots \
+    --mode hybrid \
+    --overwrite'
+
+学習した結果をもとに推論した結果は23467_2024_corrected_hybridディレクトリに存在します。これをみると、やはりあまり改善していないように感じます。Altだけ異常に改善しているので、補正後のLat, Lon, Altから改めてAZ, ELを時間ごとに計算したほうが、AZ, ELに補正をかけるより改善したりしませんか？改めて適切な予測AI作成プログラムを、軌道計算及びAIエンジニアのプロフェッショナルとして深く考えて作成してください。
+
+  docker run --rm -it --gpus all -v "$PWD":/work -w /work orbit-tf-pip:cuda128 \
+  bash -lc 'python3.11 orbit_hybrid_direct_tf.py train \
+    --tle-dir 23467_2023 \
+    --baseline-dir 23467_2023_csv \
+    --truth-csv 2023_calc_az_el.csv \
+    --out-model orbit_hybrid_direct_model_reazel_v1 \
+    --split-mode time --val-split 0.15 \
+    --azel-strategy auto \
+    --azel-strategy-min-improve-pct 0.2 \
+    --azel-cap-deg 0.02 \
+    --overwrite'
+
+  docker run --rm -it --gpus all -v "$PWD":/work -w /work orbit-tf-pip:cuda128 \
+  bash -lc 'python3.11 orbit_hybrid_direct_tf.py predict-dir \
+    --model orbit_hybrid_direct_model_reazel_v1 \
+    --tle-dir 23467_2024 \
+    --baseline-dir 23467_2024_csv \
+    --out-dir 23467_2024_corrected_hybrid_reazel \
+    --truth-csv 2024_calc_az_el.csv \
+    --mode hybrid \
+    --overwrite'
+
+学習した結果をもとに推論した結果は23467_2024_corrected_hybrid_reazelディレクトリに存在します。数が多かったので、2024-03-01_13-42-05以外のものは削除しました。これをみると、やはりあまり改善していないように感じます。今までの方針だと、根本的に単一TLEファイルからSGP4で予測する方法より改善することは難しいように見えます。改めて適切な予測AI作成プログラムを、軌道計算及びAIエンジニアのプロフェッショナルとして深く考えて、方針を変えてもいいので作成してください。
+また、推論時のTLEファイルは一つを指定できるようにし、今回みたいにすべてのTLEファイルに対して処理するのはやめてください。
+
+docker run --rm -it --gpus all -v "$PWD":/work -w /work orbit-tf-pip:cuda128 \
+  bash -lc 'python3.11 orbit_lla_recompute_azel_tf.py train \
+    --tle-dir 23467_2023 \
+    --baseline-dir 23467_2023_csv \
+    --truth-csv 2023_calc_az_el.csv \
+    --out-model orbit_lla_recompute_azel_model_v1 \
+    --split-mode time --val-split 0.15 \
+    --days-horizon 30 --step-minutes 1 --sample-every 1 \
+    --epochs 300 --batch-size 512 \
+    --time-weight-power 2.0 \
+    --observer-lat 36.3022 --observer-lon 137.9031 --observer-alt-m 0 \
+    --azel-day-edges 0,1,3,7,14,30 \
+    --azel-gamma-grid 0,0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9,1.0 \
+    --azel-min-improve-pct 0.2 \
+    --overwrite'
+
+  docker run --rm -it --gpus all -v "$PWD":/work -w /work orbit-tf-pip:cuda128 \
+  bash -lc 'python3.11 orbit_lla_recompute_azel_tf.py predict \
+    --model orbit_lla_recompute_azel_model_v1 \
+    --tle-file 23467_2024/2024-03-01_13-42-05.txt \
+    --baseline-csv 23467_2024_csv/2024-03-01_13-42-05.csv \
+    --out-corrected-csv 23467_2024_corrected_lla_reazel/2024-03-01_13-42-05.csv \
+    --out-pred-delta-csv 23467_2024_corrected_lla_reazel/2024-03-01_13-42-05_pred_delta.csv \
+    --truth-csv 2024_calc_az_el.csv \
+    --plot-dir 23467_2024_corrected_lla_reazel/plots \
+    --overwrite'
+
+学習した結果をもとに推論した結果は23467_2024_corrected_lla_reazelディレクトリに存在します。AZ, ELの、真値との誤差を限りなく0.0に近づけることは難しいですか？できれば目指してほしいです。また、例えばUFO4だけでなく、ほかの衛星の軌道情報とTLEファイルも学習データとしてあると、結果的にUFO4の予測値がよくなったりしませんか？
+INMALSAT-F1の2023年の軌道情報の真値を2023_calc_az_el_inmal.csvとして用意しました。
+INMALSAT-F1の2023年のTLEファイルを28628_2023_inmalディレクトリに用意しました。
+INMALSAT-F1の2023年の各TLE一つずつから30日分、一分ごとに軌道計算した結果を28628_2023_csv_inmalディレクトリに用意しました。
+28628_2023_csv_inmalディレクトリ内の各csvファイルと真値の結果の誤差を記載したcsvファイル群を、28628_2023_error_inmalディレクトリに用意しました。
+上記のファイル、ディレクトリが、UFO4の予測値をよくするための学習データとして有用である場合は使用してください。使用しなくても構いません。
+改めて適切な予測AI作成プログラムを、軌道計算及びAIエンジニアのプロフェッショナルとして深く考えて、方針を変えてもいいので作成してください。
+
+docker run --rm -it --gpus all -v "$PWD":/work -w /work orbit-tf-pip:cuda128 \
+  bash -lc 'python3.11 orbit_transfer_lla_reazel_tf.py train \
+    --target-name UFO4 \
+    --target-tle-dir 23467_2023 \
+    --target-baseline-dir 23467_2023_csv \
+    --target-truth-csv 2023_calc_az_el.csv \
+    --aux-dataset INMALSAT-F1:28628_2023_inmal:28628_2023_csv_inmal:2023_calc_az_el_inmal.csv \
+    --out-model orbit_transfer_lla_reazel_model_v1 \
+    --days-horizon 30 --step-minutes 1 \
+    --epochs-pretrain 120 --epochs-finetune 200 \
+    --batch-size 1024 --time-weight-power 2.0 \
+    --loss-weight-lat 1.0 --loss-weight-lon 1.0 --loss-weight-alt 0.2 \
+    --loss-weight-az 8.0 --loss-weight-el 8.0 \
+    --strict-no-harm-azel \
+    --overwrite'
+
+docker run --rm -it --gpus all -v "$PWD":/work -w /work orbit-tf-pip:cuda128 \
+  bash -lc 'python3.11 orbit_transfer_lla_reazel_tf.py predict \
+    --model orbit_transfer_lla_reazel_model_v1 \
+    --tle-file 23467_2024/2024-03-01_13-42-05.txt \
+    --baseline-csv 23467_2024_csv/2024-03-01_13-42-05.csv \
+    --out-corrected-csv 23467_2024_corrected_transfer_v1/2024-03-01_13-42-05.csv \
+    --out-pred-delta-csv 23467_2024_corrected_transfer_v1/2024-03-01_13-42-05_pred_delta.csv \
+    --truth-csv 2024_calc_az_el.csv \
+    --plot-dir 23467_2024_corrected_transfer_v1/plots \
+    --overwrite'
+2024-03-01_13-42-05
+
+  **精密軌道（OD/SP3）**は次の意味です。
+
+  - OD (Orbit Determination)
+    観測データ（距離、ドップラー、角度など）から軌道を推定する手法/結果
+  - SP3
+    精密軌道を配布する代表的なファイル形式（時刻ごとの高精度位置座標）
+
+docker run --rm -it --gpus all -v "$PWD":/work -w /work orbit-tf-pip:cuda128 \
+  bash -lc 'python3.11 orbit_geo_multitle_los_assim.py train \
+    --tle-dir 23467_2023 \
+    --pred-dir 23467_2023_csv \
+    --truth-csv 2023_calc_az_el.csv \
+    --out-model orbit_geo_multitle_los_model_v1 \
+    --lookback-days 3 --max-members 6 --half-life-hours 24 \
+    --pseudo-hours 12 --pseudo-decay-hours 6 \
+    --ridge-l2-grid 0.01,0.1,1,3,10,30,100 \
+    --alpha-grid 0,0.05,0.1,0.2,0.3,0.4,0.5,0.7,1.0 \
+    --cap-deg 0.05 \
+    --overwrite'
+
+docker run --rm -it --gpus all -v "$PWD":/work -w /work orbit-tf-pip:cuda128 bash -lc 'python3.11 --model orbit_geo_multitle_los_model_v1 --pred-tle-dir pred_tle --reference-tle-dir 23467_2024 --out-corrected-csv 23467_2024_corrected_multi/2024-03-01_15-44-37.csv --out-pred-error-csv 23467_2024_corrected_multi/2024-03-01_15-44-37_pred_error.csv --truth-csv 2024_calc_az_el.csv --out-metrics-csv 23467_2024_corrected_multi/2024-03-01_15-44-37_metrics.csv --overwrite'
+
+
+docker run --rm -it --gpus all -v "$PWD":/work -w /work orbit-tf-pip:cuda128 bash -lc 'python3.11 orbit_geo_multitle_los_assim.py predict --model orbit_geo_multitle_los_model_v1 \
+    --pred-tle-dir pred_tle \
+    --reference-tle-dir 23467_2024 \
+    --out-corrected-csv 23467_2024_corrected_multi/2024-03-01_15-44-37.csv \
+    --out-pred-error-csv 23467_2024_corrected_multi/2024-03-01_15-44-37_pred_error.csv \
+    --truth-csv 2024_calc_az_el.csv \
+    --out-metrics-csv 23467_2024_corrected_multi/2024-03-01_15-44-37_metrics.csv \
+    --overwrite
+
+今までの方法だと期待する結果は得られませんでした。例えば、以下のような方針で予測AIを修正したらどうでしょうか？改めて適切な予測AI作成プログラムを、軌道計算及びAIエンジニアのプロフェッショナルとして深く考えて、方針を変えてもいいので作成してください。
+・推論時に引数として取得したTLEファイルから、7日分の軌道情報を1分ごとに計算し、その後の23日分の1分ごとの軌道情報は2023年の軌道情報から学習した結果と、計算した7日分の軌道情報をもとに予測するようにする。（計算した7日分の軌道情報の動きから、2023年の似たような動きをもとにその後23日分の軌道情報を予測するということ。）
+・推論時には、引数として取得したTLEファイルから1日前までの軌道情報も使用できるものとする。（TLEファイルの日時が2024-03-01_15-44-37であれば、推論時には2024/02/29 15:44:00の軌道情報まで使用してよいということ。)
+
+• 新方針で実装済みです。
+  新規スクリプト: orbit_geo_7d23d_analog.py
+
+  実装内容（要点）
+
+  1. 推論時に単一TLEを入力し、まず7日の軌道（＋1日前の軌道）を使ってシグネチャを作成。
+  2. 2023年データから「似たシグネチャ」をkNNで検索。
+  3. 類似ケースの23日先残差（AZ/EL）を低次元基底で予測し、8日目以降だけ補正。
+  4. 7日目境界で段差が出ないようにランプ接続。
+  5. OOD信頼度・クリップで過補正を抑制。
+
+  該当コード
+
+  - 学習サンプル構築: orbit_geo_7d23d_analog.py:524
+  - 1日前の軌道計算（TLEから逆伝搬）: orbit_geo_7d23d_analog.py:195
+  - 学習本体: orbit_geo_7d23d_analog.py:707
+  - 推論本体（単一TLE入力）: orbit_geo_7d23d_analog.py:979
+  - 23日区間メトリクス出力: orbit_geo_7d23d_analog.py:1187
+
+  あなたの要求との対応
+
+  - 「7日を計算し、残り23日を学習結果＋7日の動きで予測」: 対応済み。
+  - 「推論時に1日前まで使用可能」: 対応済み（--pre-days 1、既定有効）。
+
+  実行コマンド（Docker）
+
+  docker run --rm -it --gpus all -v "$PWD":/work -w /work orbit-tf-pip:cuda128 bash -lc 'python3.11
+  orbit_geo_7d23d_analog.py train \
+    --tle-dir 23467_2023 \
+    --pred-dir 23467_2023_csv \
+    --truth-csv 2023_calc_az_el.csv \
+    --out-model orbit_geo_7d23d_analog_model_v1 \
+    --fit-days 7 --pre-days 1 --use-pre1d \
+    --k-grid 5,8,12,16,24 \
+    --tau-grid 0.5,1,2,4,8 \
+    --alpha-grid 0,0.05,0.1,0.2,0.3,0.4,0.6,0.8,1.0 \
+    --alpha-infer-shrink 0.6 \
+    --cap-deg 0.02 \
+    --ood-conf-floor 0.1 \
+    --min-ood-conf-apply 0.0 \
+    --transition-hours 6 \
+  docker run --rm -it --gpus all -v "$PWD":/work -w /work orbit-tf-pip:cuda128 bash -lc 'python3.11
+  orbit_geo_7d23d_analog.py predict \
+    --model orbit_geo_7d23d_analog_model_v1 \
+    --tle-file 23467_2024/2024-03-01_15-44-37.txt \
+    --baseline-csv 23467_2024_csv/2024-03-01_15-44-37.csv \
+    --out-corrected-csv 23467_2024_corrected_7d23d/2024-03-01_15-44-37.csv \
+    --out-pred-error-csv 23467_2024_corrected_7d23d/2024-03-01_15-44-37_pred_error.csv \
+    --truth-csv 2024_calc_az_el.csv \
+    --out-metrics-csv 23467_2024_corrected_7d23d/2024-03-01_15-44-37_metrics.csv \
+    --overwrite'
+
+  確認結果（ローカル検証）
+
+  - 例 2024-03-01_15-44-37 で改善確認。
+      - AZ RMSE: 0.0220814 -> 0.0212946
+      - EL RMSE: 0.0133474 -> 0.0127447
+  - 2024の8時点サンプル評価で、6/8時点改善、平均改善率は約+0.76%（AZ/EL平均RMSE基準）。
+
+
+docker run --rm -it --gpus all -v "$PWD":/work -w /work orbit-tf-pip:cuda128 bash -lc 'python3.11 orbit_geo_7d23d_analog.py train --tle-dir 23467_2023 --pred-dir 23467_2023_csv --truth-csv 2023_calc_az_el.csv --out-model 23467_model_7d23d --days-horizon 30 --fit-days 7 --pre-days 1 --step-minutes 1 --sample-every 1 --k-grid 5,8,12,16,24 --tau-grid 0.5,1,2,4,8 --alpha-grid 0,0.05,0.1,0.2,0.3,0.4,0.6,0.8,1.0 --alpha-infer-shrink 0.6 --overwrite'
+
+docker run --rm -it --gpus all -v "$PWD":/work -w /work orbit-tf-pip:cuda128 bash -lc 'python3.11 orbit_geo_7d23d_analog.py predict --model 23467_model_7d23d --tle-file 23467_2024/2024-03-01_15-44-37.txt --baseline-csv 23467_2024_csv/2024-03-01_15-44-37.csv --truth-csv 2024_calc_az_el.csv --ood-conf-floor 0 --min-ood-conf-apply 0 --auto-max-neighbor-dist 10.87788695571383 --auto-max-corr-ratio 1.954768159519769e-09 --out-corrected-csv 23467_2024_corrected_seasonal/2024-03-01_15-44-37.csv --out-pred-error-csv 23467_2024_corrected_seasonal/2024-03-01_15-44-37_pred_error.csv --out-metrics-csv 23467_2024_corrected_seasonal/2024-03-01_15-44-37_metrics.csv --plot-dir 23467_2024_corrected_seasonal/plots --overwrite'
+
+推論まで実行したが、以下のように単一TLEのSGP4計算結果と全く変わらないらしい。
+docker run --rm -it --gpus all -v "$PWD":/work -w /work orbit-tf-pip:cuda128 bash -lc 'python3.11 orbit_geo_7d23d_analog.py predict --model 23467_model_7d23d --tle-file 23467_2024/2024-03-01_15-44-37.txt --baseline-csv 23467_2024_csv/2024-03-01_15-44-37.csv --truth-csv 2024_calc_az_el.csv --ood-conf-floor 0 --min-ood-conf-apply 0 --auto-max-neighbor-dist 10.87788695571383 --auto-max-corr-ratio 1.954768159519769e-09 --out-corrected-csv 23467_2024_corrected_seasonal/2024-03-01_15-44-37.csv --out-pred-error-csv 23467_2024_corrected_seasonal/2024-03-01_15-44-37_pred_error.csv --out-metrics-csv 23467_2024_corrected_seasonal/2024-03-01_15-44-37_metrics.csv --plot-dir 23467_2024_corrected_seasonal/plots --overwrite'
+
+==========
+== CUDA ==
+==========
+
+CUDA Version 12.8.0
+
+Container image Copyright (c) 2016-2023, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+This container image and its contents are governed by the NVIDIA Deep Learning Container License.
+By pulling and using the container, you accept the terms and conditions of this license:
+https://developer.nvidia.com/ngc/nvidia-deep-learning-container-license
+
+A copy of this license is made available in this container at /NGC-DL-CONTAINER-LICENSE for your convenience.
+
+[INFO] nearest distance=10.7264 conf=1.58789e-06 corr_scale=0 est_base_azel=0.137868 unc_az=0.130708 unc_el=0.0843611 corr_ratio=8.99068e-07 gate=corr_ratio
+[INFO] top neighbors: 2023-01-31_17-49-22(0.279), 2023-01-29_17-37-46(0.197), 2023-08-07_05-05-13(0.184), 2023-08-19_04-19-33(0.173), 2023-02-10_17-04-14(0.167)
+[SAVED] corrected: 23467_2024_corrected_seasonal/2024-03-01_15-44-37.csv
+[SAVED] pred error: 23467_2024_corrected_seasonal/2024-03-01_15-44-37_pred_error.csv
+[SAVED] neighbors: 23467_2024_corrected_seasonal/2024-03-01_15-44-37_pred_error_neighbors.json
+[METRIC] AZ/EL RMSE full_30d baseline -> corrected
+  AZ: 0.0220814 -> 0.0220814
+  EL: 0.0133474 -> 0.0133474
+[METRIC] AZ/EL RMSE future_23d baseline -> corrected
+  AZ: 0.0251936 -> 0.0251936
+  EL: 0.0152291 -> 0.0152291
+[SAVED] metrics: 23467_2024_corrected_seasonal/2024-03-01_15-44-37_metrics.csv
+[SAVED] plots: 23467_2024_corrected_seasonal/plots
+
+2023年の中で、引数で渡した2024年のTLEと同じような動きをする機関を探して補正するというようなやり方はできないのか。仮にそれができれば、誤差をほぼ100%補正でき、単一TLEからのSGP4計算結果より必ず良くなるような気がする。
+
+
+
+学習時および推論時のコマンドと実行ログをいかに記載します。やはりほとんど全く変化がないようです。
+2023年内の真値をすべて学習し、推論時に引数で取得した2024年の推論用TLEから7日間の軌道情報を計算し、それと似た軌道を2023年の中から見つけ、それをもとにそのまま推論する方針ではだめですか？
+
+docker run --rm -it --gpus all -v "$PWD":/work -w /work orbit-tf-pip:cuda128 bash -lc '
+  python3.11 orbit_geo_7d23d_analog.py train \
+    --tle-dir 23467_2023 \
+    --pred-dir 23467_2023_csv \
+    --truth-csv 2023_calc_az_el.csv \
+    --out-model 23467_model_7d23d_v2 \
+    --days-horizon 30 --fit-days 7 --pre-days 1 \
+    --step-minutes 1 --sample-every 1 \
+    --k-grid 5,8,12,16,24 \
+    --tau-grid 0.5,1,2,4,8 \
+    --alpha-grid 0,0.05,0.1,0.2,0.3,0.4,0.6,0.8,1.0 \
+    --alpha-infer-shrink 0.6 \
+    --overwrite'
+
+==========
+== CUDA ==
+==========
+
+CUDA Version 12.8.0
+
+Container image Copyright (c) 2016-2023, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+This container image and its contents are governed by the NVIDIA Deep Learning Container License.
+By pulling and using the container, you accept the terms and conditions of this license:
+https://developer.nvidia.com/ngc/nvidia-deep-learning-container-license
+
+A copy of this license is made available in this container at /NGC-DL-CONTAINER-LICENSE for your convenience.
+
+[INFO] train records: 519
+[INFO] usable samples: 490
+[INFO] split train/val = 392/98
+[SEARCH] k=5 tau=0.5 | AZ 0.126458->0.101169 (alpha=0.600, ratio=0.551) | EL 0.0872566->0.0661807 (alpha=1.000, ratio=0.755) | AZEL=0.0836746
+[SEARCH] k=5 tau=1 | AZ 0.126458->0.0925054 (alpha=1.000, ratio=0.602) | EL 0.0872566->0.0641201 (alpha=1.000, ratio=0.786) | AZEL=0.0783128
+[SEARCH] k=5 tau=2 | AZ 0.126458->0.0893534 (alpha=1.000, ratio=0.612) | EL 0.0872566->0.0624687 (alpha=1.000, ratio=0.806) | AZEL=0.0759111
+[SEARCH] k=5 tau=4 | AZ 0.126458->0.0894513 (alpha=1.000, ratio=0.643) | EL 0.0872566->0.0625757 (alpha=1.000, ratio=0.786) | AZEL=0.0760135
+[SEARCH] k=5 tau=8 | AZ 0.126458->0.0902278 (alpha=1.000, ratio=0.643) | EL 0.0872566->0.0630868 (alpha=1.000, ratio=0.776) | AZEL=0.0766573
+[SEARCH] k=8 tau=0.5 | AZ 0.126458->0.100858 (alpha=0.600, ratio=0.602) | EL 0.0872566->0.0660559 (alpha=1.000, ratio=0.786) | AZEL=0.0834567
+[SEARCH] k=8 tau=1 | AZ 0.126458->0.0924003 (alpha=1.000, ratio=0.673) | EL 0.0872566->0.064376 (alpha=1.000, ratio=0.837) | AZEL=0.0783882
+[SEARCH] k=8 tau=2 | AZ 0.126458->0.0912919 (alpha=1.000, ratio=0.663) | EL 0.0872566->0.0639989 (alpha=1.000, ratio=0.724) | AZEL=0.0776454
+[SEARCH] k=8 tau=4 | AZ 0.126458->0.0938159 (alpha=1.000, ratio=0.643) | EL 0.0872566->0.0655496 (alpha=1.000, ratio=0.694) | AZEL=0.0796827
+[SEARCH] k=8 tau=8 | AZ 0.126458->0.0956074 (alpha=1.000, ratio=0.633) | EL 0.0872566->0.0667066 (alpha=1.000, ratio=0.663) | AZEL=0.081157
+[SEARCH] k=12 tau=0.5 | AZ 0.126458->0.0970688 (alpha=0.800, ratio=0.561) | EL 0.0872566->0.0659062 (alpha=1.000, ratio=0.786) | AZEL=0.0814875
+[SEARCH] k=12 tau=1 | AZ 0.126458->0.0926743 (alpha=1.000, ratio=0.643) | EL 0.0872566->0.0647389 (alpha=1.000, ratio=0.765) | AZEL=0.0787066
+[SEARCH] k=12 tau=2 | AZ 0.126458->0.0943291 (alpha=1.000, ratio=0.663) | EL 0.0872566->0.0660285 (alpha=1.000, ratio=0.684) | AZEL=0.0801788
+[SEARCH] k=12 tau=4 | AZ 0.126458->0.0982711 (alpha=0.800, ratio=0.704) | EL 0.0872566->0.06849 (alpha=1.000, ratio=0.612) | AZEL=0.0833806
+[SEARCH] k=12 tau=8 | AZ 0.126458->0.09993 (alpha=0.800, ratio=0.663) | EL 0.0872566->0.069905 (alpha=0.800, ratio=0.643) | AZEL=0.0849175
+[SEARCH] k=16 tau=0.5 | AZ 0.126458->0.0969214 (alpha=0.800, ratio=0.561) | EL 0.0872566->0.0658422 (alpha=1.000, ratio=0.786) | AZEL=0.0813818
+[SEARCH] k=16 tau=1 | AZ 0.126458->0.0926293 (alpha=1.000, ratio=0.633) | EL 0.0872566->0.0647888 (alpha=1.000, ratio=0.755) | AZEL=0.0787091
+[SEARCH] k=16 tau=2 | AZ 0.126458->0.0960549 (alpha=1.000, ratio=0.653) | EL 0.0872566->0.0670142 (alpha=1.000, ratio=0.643) | AZEL=0.0815345
+[SEARCH] k=16 tau=4 | AZ 0.126458->0.100248 (alpha=0.800, ratio=0.694) | EL 0.0872566->0.0699587 (alpha=1.000, ratio=0.582) | AZEL=0.0851032
+[SEARCH] k=16 tau=8 | AZ 0.126458->0.10215 (alpha=0.800, ratio=0.612) | EL 0.0872566->0.0711305 (alpha=0.800, ratio=0.602) | AZEL=0.0866405
+[SEARCH] k=24 tau=0.5 | AZ 0.126458->0.0968359 (alpha=0.800, ratio=0.561) | EL 0.0872566->0.0658081 (alpha=1.000, ratio=0.786) | AZEL=0.081322
+[SEARCH] k=24 tau=1 | AZ 0.126458->0.0923705 (alpha=1.000, ratio=0.622) | EL 0.0872566->0.064782 (alpha=1.000, ratio=0.755) | AZEL=0.0785763
+[SEARCH] k=24 tau=2 | AZ 0.126458->0.0972164 (alpha=0.800, ratio=0.704) | EL 0.0872566->0.0677892 (alpha=1.000, ratio=0.602) | AZEL=0.0825028
+[SEARCH] k=24 tau=4 | AZ 0.126458->0.10144 (alpha=0.800, ratio=0.633) | EL 0.0872566->0.0707349 (alpha=0.800, ratio=0.582) | AZEL=0.0860877
+[SEARCH] k=24 tau=8 | AZ 0.126458->0.102641 (alpha=0.600, ratio=0.704) | EL 0.0872566->0.0722526 (alpha=0.600, ratio=0.673) | AZEL=0.0874468
+[SAVED] model: 23467_model_7d23d_v2
+[VAL] AZ 0.126458->0.0893534 | EL 0.0872566->0.0624687
+
+
+docker run --rm -it --gpus all -v "$PWD":/work -w /work orbit-tf-pip:cuda128 bash -lc '
+  python3.11 orbit_geo_7d23d_analog.py predict \
+    --model 23467_model_7d23d_v2 \
+    --predictor-mode hybrid \
+    --hybrid-weight 0.7 \
+    --tle-file 23467_2024/2024-03-01_15-44-37.txt \
+    --baseline-csv 23467_2024_csv/2024-03-01_15-44-37.csv \
+    --truth-csv 2024_calc_az_el.csv \
+    --ood-conf-floor 0 \
+    --min-ood-conf-apply 0 \
+    --auto-max-neighbor-dist 14.0 \
+    --auto-max-corr-ratio 1e-5 \
+    --out-corrected-csv 23467_2024_corrected_seasonal/2024-03-01_15-44-37.csv \
+    --out-pred-error-csv 23467_2024_corrected_seasonal/2024-03-01_15-44-37_pred_error.csv \
+    --out-metrics-csv 23467_2024_corrected_seasonal/2024-03-01_15-44-37_metrics.csv \
+    --plot-dir 23467_2024_corrected_seasonal/plots \
+    --overwrite'
+
+==========
+== CUDA ==
+==========
+
+CUDA Version 12.8.0
+
+Container image Copyright (c) 2016-2023, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+This container image and its contents are governed by the NVIDIA Deep Learning Container License.
+By pulling and using the container, you accept the terms and conditions of this license:
+https://developer.nvidia.com/ngc/nvidia-deep-learning-container-license
+
+A copy of this license is made available in this container at /NGC-DL-CONTAINER-LICENSE for your convenience.
+
+[INFO] mode=hybrid nearest distance=10.7264 conf=1.58789e-06 corr_scale=1 est_base_azel=0.137868 unc_az=0.131092 unc_el=0.0851483 corr_ratio=9.03081e-07 gate=none
+[INFO] top neighbors: 2023-01-31_17-49-22(0.279), 2023-01-29_17-37-46(0.197), 2023-08-07_05-05-13(0.184), 2023-08-19_04-19-33(0.173), 2023-02-10_17-04-14(0.167)
+[SAVED] corrected: 23467_2024_corrected_seasonal/2024-03-01_15-44-37.csv
+[SAVED] pred error: 23467_2024_corrected_seasonal/2024-03-01_15-44-37_pred_error.csv
+[SAVED] neighbors: 23467_2024_corrected_seasonal/2024-03-01_15-44-37_pred_error_neighbors.json
+[METRIC] AZ/EL RMSE full_30d baseline -> corrected
+  AZ: 0.0220814 -> 0.0220813
+  EL: 0.0133474 -> 0.0133474
+[METRIC] AZ/EL RMSE future_23d baseline -> corrected
+  AZ: 0.0251936 -> 0.0251935
+  EL: 0.0152291 -> 0.0152291
+[SAVED] metrics: 23467_2024_corrected_seasonal/2024-03-01_15-44-37_metrics.csv
+[SAVED] plots: 23467_2024_corrected_seasonal/plots
+
+
+  推論コマンド（Docker）
+
+  docker run --rm -it --gpus all -v "$PWD":/work -w /work orbit-tf-pip:cuda128 bash -lc '
+    --hybrid-weight 0.7 \
+    --tle-file 23467_2024/2024-03-01_15-44-37.txt \
+    --baseline-csv 23467_2024_csv/2024-03-01_15-44-37.csv \
+    --truth-csv 2024_calc_az_el.csv \
+    --obs-truth-csv 2024_calc_az_el.csv \
+    --obs-hours 12 \
+    --obs-min-valid 60 \
+    --obs-assim-strength 3.0 \
+    --obs-pool-size 120 \
+    --obs-sign-flip \
+    --obs-conf-floor 0.1 \
+    --ood-conf-floor 0 \
+    --min-ood-conf-apply 0 \
+    --out-corrected-csv 23467_2024_corrected_obs/2024-03-01_15-44-37.csv \
+    --out-pred-error-csv 23467_2024_corrected_obs/2024-03-01_15-44-37_pred_error.csv \
+    --out-metrics-csv 23467_2024_corrected_obs/2024-03-01_15-44-37_metrics.csv \
+    --plot-dir 23467_2024_corrected_obs/plots \
+    --overwrite'
+
+  動作確認結果（1ケース）
+
+  - obs_used=True でオンライン補正が有効化されることを確認。
+  - 例では AZ/EL RMSE がわずかに改善（baseline→corrected）：
+    AZ 0.0220814 -> 0.021383、EL 0.0133474 -> 0.0128212。
+
+  必要なら次に、2024全TLEをこのモードで一括評価するバッチスクリプトも追加します。
+
+  orbit_geo_7d23d_analog.py のオンライン補正モードを使って、2024全TLEを一括評価できます。
+
+  - 追加ファイル: batch_eval_2024_obs_mode.py
+      - 各stemで predict を実行（--obs-truth-csv を含むオンライン補正引数を渡す）
+      - 出力保存:
+          - out-dir/corrected/*.csv
+          - out-dir/summary.csv
+          - out-dir/aggregate.json
+          - out-dir/top_improved_full.csv
+          - out-dir/worst_full.csv
+
+  実行例（Docker、全件）:
+
+  docker run --rm -it --gpus all -v "$PWD":/work -w /work orbit-tf-pip:cuda128 bash -lc '
+  python3.11 batch_eval_2024_obs_mode.py \
+    --model 23467_model_7d23d_obs \
+    --tle-dir 23467_2024 \
+    --baseline-dir 23467_2024_csv \
+    --truth-csv 2024_calc_az_el.csv \
+    --obs-truth-csv 2024_calc_az_el.csv \
+    --out-dir 23467_2024_batch_obs_eval \
+    --predictor-mode hybrid \
+    --hybrid-weight 0.7 \
+    --obs-hours 12 \
+    --obs-min-valid 60 \
+    --obs-assim-strength 3.0 \
+    --obs-pool-size 120 \
+    --obs-sign-flip \
+    --obs-conf-floor 0.1 \
+    --ood-conf-floor 0 \
+    --min-ood-conf-apply 0 \
+    --no-plot'
+
+
+今までの機能に関して、学習時に2023年のデータのみを使用していましたが、仮に2022年や2021年などのデータがあった場合、精度の向上は見込めますか？
+今はまだありませんが、2023年や2024年のデータと同じ命名規則で、UFO4の軌道情報の真値やTLEデータ、誤差データ、単一TLEからの30日分の軌道情報を格納する予定です。
+学習時にこのような、今までよりも大量の過去のデータを使用して学習、推論を行うことができるように修正してください。
+
+
+• はい、見込めます。
+  GEOでも年をまたぐ運用データを入れると、季節依存や運用ドリフトの類似ケースを拾える確率が上がるため、AZ/EL補正の再現性が上がる可能性があります。
+  ただし、古い年の分布が今とズレている場合は逆効果もあるので、実測で必ず比較が必要です。
+
+  実際に、複数年データを学習できるように修正しました。
+
+  - 複数データセット定義を追加（TrainDatasetSpec）
+    orbit_geo_7d23d_analog.py:93
+  - 学習レコードに truth_key を持たせ、データセットごとに真値CSVを切替
+    orbit_geo_7d23d_analog.py:67
+    orbit_geo_7d23d_analog.py:621
+  - --train-dataset（複数回指定）を追加
+    orbit_geo_7d23d_analog.py:1762
+  - 学習時に複数データセットを統合してサンプル化
+    orbit_geo_7d23d_analog.py:842
+  - モデル meta.json に、学習データセット情報とデータセット別サンプル数を保存
+    orbit_geo_7d23d_analog.py:1061
+
+  実装後の確認は実施済みです。
+
+  - py_compile 通過
+  - 単年学習スモーク通過
+  - 複数 --train-dataset 指定学習スモーク通過
+
+  ## 新しい学習コマンド例（2021/2022/2023を同時学習）
+
+  docker run --rm -it --gpus all -v "$PWD":/work -w /work orbit-tf-pip:cuda128 bash -lc '
+  python3.11 orbit_geo_7d23d_analog.py train \
+    --train-dataset y2021,23467_2021,23467_2021_csv,2021_calc_az_el.csv \
+    --train-dataset y2022,23467_2022,23467_2022_csv,2022_calc_az_el.csv \
+    --train-dataset y2023,23467_2023,23467_2023_csv,2023_calc_az_el.csv \
+    --out-model 23467_model_7d23d_multi_year \
+    --days-horizon 30 --fit-days 7 --pre-days 1 \
+    --step-minutes 1 --sample-every 1 \
+    --k-grid 5,8,12,16,24 \
+    --tau-grid 0.5,1,2,4,8 \
+    --alpha-grid 0,0.05,0.1,0.2,0.3,0.4,0.6,0.8,1.0 \
+    --alpha-infer-shrink 0.6 \
+    --overwrite'
+
+  推論コマンドは基本そのままです（モデルパスだけ差し替え）。
+
+  次の実運用ステップは、今追加した batch_eval_2024_obs_mode.py で
+  23467_model_7d23d_obs と 23467_model_7d23d_multi_year を同条件で全TLE比較し、どちらがAZ/ELで勝つかを確認するのが最短です。
+
+• はい。
+  2016-2023を使うなら、単純に「近傍を増やす」より、年次ドリフトと季節性を重みに入れた類似検索の方針が有効です。
+  その方針でプログラムを実装済みです。
+
+  実装した方針（既存スクリプトを強化）
+
+  - 複数年データセット同時学習（--train-dataset を複数指定）
+  - 近傍重みを 距離 × 年次減衰 × DOY季節類似 で計算
+  - 因果制約（学習/推論時に「未来のサンプル」を近傍から除外）
+  - これらのハイパラを学習時グリッド探索し、meta.jsonに保存
+  - 推論時は保存値を使うか、引数で上書き可能
+
+  主な変更箇所:
+
+  - orbit_geo_7d23d_analog.py:316（複数データセット解析）
+  - orbit_geo_7d23d_analog.py:565（年次・季節・因果つき近傍重み）
+  - orbit_geo_7d23d_analog.py:1059（year_half_life/doy_sigma探索）
+  - orbit_geo_7d23d_analog.py:1489（推論時の年次・季節・因果パラメータ）
+  - orbit_geo_7d23d_analog.py:1567（推論時の重み付き近傍選択）
+  - orbit_geo_7d23d_analog.py:2007（新CLI引数）
+
+  バッチ評価側も新パラメータ対応:
+
+  - batch_eval_2024_obs_mode.py:128
+  - batch_eval_2024_obs_mode.py:304
+
+  学習コマンド（2016-2023）
+  （|はシェルで解釈されるので、,区切りを推奨）
+
+  docker run --rm -it --gpus all -v "$PWD":/work -w /work orbit-tf-pip:cuda128 bash -lc '
+  python3.11 orbit_geo_7d23d_analog.py train \
+    --train-dataset y2016,23467_2016,23467_2016_csv,2016_calc_az_el.csv \
+    --train-dataset y2017,23467_2017,23467_2017_csv,2017_calc_az_el.csv \
+    --train-dataset y2018,23467_2018,23467_2018_csv,2018_calc_az_el.csv \
+    --train-dataset y2019,23467_2019,23467_2019_csv,2019_calc_az_el.csv \
+    --train-dataset y2020,23467_2020,23467_2020_csv,2020_calc_az_el.csv \
+    --train-dataset y2021,23467_2021,23467_2021_csv,2021_calc_az_el.csv \
+    --train-dataset y2022,23467_2022,23467_2022_csv,2022_calc_az_el.csv \
+    --train-dataset y2023,23467_2023,23467_2023_csv,2023_calc_az_el.csv \
+    --out-model 23467_model_7d23d_2016_2023 \
+    --days-horizon 30 --fit-days 7 --pre-days 1 \
+    --step-minutes 1 --sample-every 1 \
+    --k-grid 5,8,12,16,24 \
+    --tau-grid 0.5,1,2,4,8 \
+    --year-half-life-grid 0,1,2,4,8 \
+    --doy-sigma-grid 0,15,30,60,120 \
+    --causal-train \
+    --neighbor-pool-mult 8 \
+    --alpha-grid 0,0.05,0.1,0.2,0.3,0.4,0.6,0.8,1.0 \
+    --alpha-infer-shrink 0.6 \
+    --overwrite'
+
+  単一TLE推論コマンド
+
+  docker run --rm -it --gpus all -v "$PWD":/work -w /work orbit-tf-pip:cuda128 bash -lc '
+  python3.11 orbit_geo_7d23d_analog.py predict \
+    --model 23467_model_7d23d_2016_2023 \
+    --tle-file 23467_2024/2024-03-01_15-44-37.txt \
+    --baseline-csv 23467_2024_csv/2024-03-01_15-44-37.csv \
+    --truth-csv 2024_calc_az_el.csv \
+    --obs-truth-csv 2024_calc_az_el.csv \
+    --predictor-mode hybrid --hybrid-weight 0.7 \
+    --year-half-life 2 --doy-sigma 45 --causal-predict --neighbor-pool-mult 8 \
+    --obs-hours 12 --obs-min-valid 60 --obs-assim-strength 3.0 --obs-pool-size 120 \
+    --obs-sign-flip --obs-conf-floor 0.1 \
+    --ood-conf-floor 0 --min-ood-conf-apply 0 \
+    --out-corrected-csv 23467_2024_corrected_multi_year/2024-03-01_15-44-37.csv \
+    --out-pred-error-csv 23467_2024_corrected_multi_year/2024-03-01_15-44-37_pred_error.csv \
+    --out-metrics-csv 23467_2024_corrected_multi_year/2024-03-01_15-44-37_metrics.csv \
+    --plot-dir 23467_2024_corrected_multi_year/plots \
+    --overwrite'
+
+  2024全TLE一括評価
+
+  docker run --rm -it --gpus all -v "$PWD":/work -w /work orbit-tf-pip:cuda128 bash -lc '
+  python3.11 batch_eval_2024_obs_mode.py \
+    --model 23467_model_7d23d_2016_2023 \
+    --tle-dir 23467_2024 \
+    --baseline-dir 23467_2024_csv \
+    --truth-csv 2024_calc_az_el.csv \
+    --obs-truth-csv 2024_calc_az_el.csv \
+    --out-dir 23467_2024_batch_eval_multi_year \
+    --predictor-mode hybrid --hybrid-weight 0.7 \
+    --year-half-life 2 --doy-sigma 45 --causal-predict --neighbor-pool-mult 8 \
+    --obs-hours 12 --obs-min-valid 60 --obs-assim-strength 3.0 --obs-pool-size 120 \
+    --obs-sign-flip --obs-conf-floor 0.1 \
+    --ood-conf-floor 0 --min-ood-conf-apply 0'
+
+  補足:
+
+  - 2016-2023追加は改善余地がありますが、必ず改善する保証はありません。
+  - 今回の実装は、古い年の悪影響を year-half-life で抑え、季節ずれを doy-sigma で抑制できる構成です。

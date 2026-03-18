@@ -44,6 +44,20 @@ class Episode:
     static_features: np.ndarray
 
 
+@dataclass
+class LlaResidualPack:
+    tle_name: str
+    unix: np.ndarray
+    baseline_azel: np.ndarray
+    true_azel: np.ndarray
+    pred_azel: np.ndarray
+    baseline_lla: np.ndarray
+    pred_lla_geo: np.ndarray
+    true_lla: np.ndarray
+    forecast_mask: np.ndarray
+    static_features: np.ndarray
+
+
 MINUTES_PER_DAY = 24 * 60
 MINUTES_PER_YEAR = 365 * MINUTES_PER_DAY
 
@@ -1338,6 +1352,188 @@ def plot_full_target_compare_and_error(
     return [out_compare_png, out_error_png]
 
 
+def recompute_azel_from_lla_np(
+    sat_lla: np.ndarray,
+    observer_lat: float,
+    observer_lon: float,
+    observer_alt_m: float,
+) -> np.ndarray:
+    lla = np.asarray(sat_lla, dtype=np.float64)
+    sx, sy, sz = core.geodetic_to_ecef_km(lla[:, 0], lla[:, 1], lla[:, 2])
+    ox, oy, oz = core.geodetic_to_ecef_km(
+        np.asarray([float(observer_lat)], dtype=np.float64),
+        np.asarray([float(observer_lon)], dtype=np.float64),
+        np.asarray([float(observer_alt_m) / 1000.0], dtype=np.float64),
+    )
+    dx = sx - float(ox[0])
+    dy = sy - float(oy[0])
+    dz = sz - float(oz[0])
+
+    lat0 = math.radians(float(observer_lat))
+    lon0 = math.radians(float(observer_lon))
+    sl = math.sin(lat0)
+    cl = math.cos(lat0)
+    so = math.sin(lon0)
+    co = math.cos(lon0)
+
+    e = -so * dx + co * dy
+    n = -sl * co * dx - sl * so * dy + cl * dz
+    u = cl * co * dx + cl * so * dy + sl * dz
+
+    az = core.wrap360(np.rad2deg(np.arctan2(e, n)))
+    el = np.clip(np.rad2deg(np.arctan2(u, np.sqrt(np.maximum(1.0e-12, e * e + n * n)))), -90.0, 90.0)
+    return np.column_stack([az, el]).astype(np.float64)
+
+
+def build_lla_residual_features(
+    unix: np.ndarray,
+    baseline_azel: np.ndarray,
+    pred_azel: np.ndarray,
+    baseline_lla: np.ndarray,
+    pred_lla_geo: np.ndarray,
+    static_features: np.ndarray,
+    yearly_harmonics: int,
+) -> np.ndarray:
+    u = np.asarray(unix, dtype=np.float64).reshape(-1)
+    base_az = np.asarray(baseline_azel, dtype=np.float64)
+    pred_az = np.asarray(pred_azel, dtype=np.float64)
+    base_lla = np.asarray(baseline_lla, dtype=np.float64)
+    pred_lla = np.asarray(pred_lla_geo, dtype=np.float64)
+    n = int(u.shape[0])
+    if n == 0:
+        return np.zeros((0, 1), dtype=np.float32)
+
+    time_feat = hm.build_time_cyclic_features_np(unix=u, yearly_harmonics=int(max(0, int(yearly_harmonics))))
+    trig_base = hm.azel_to_trig4(base_az).astype(np.float32)
+    trig_pred = hm.azel_to_trig4(pred_az).astype(np.float32)
+
+    lon_b = np.deg2rad(base_lla[:, 1])
+    lon_p = np.deg2rad(pred_lla[:, 1])
+    d_az = (core.angle_diff_deg(pred_az[:, 0], base_az[:, 0]) / 180.0).astype(np.float32).reshape(-1, 1)
+    d_el = ((pred_az[:, 1] - base_az[:, 1]) / 90.0).astype(np.float32).reshape(-1, 1)
+    d_lat = (pred_lla[:, 0] - base_lla[:, 0]).astype(np.float32).reshape(-1, 1)
+    d_lon = core.angle_diff_deg(pred_lla[:, 1], base_lla[:, 1]).astype(np.float32).reshape(-1, 1)
+    d_alt = (pred_lla[:, 2] - base_lla[:, 2]).astype(np.float32).reshape(-1, 1)
+
+    static = np.repeat(np.asarray(static_features, dtype=np.float32).reshape(1, -1), n, axis=0)
+    x_parts = [
+        time_feat.astype(np.float32),
+        trig_base.astype(np.float32),
+        trig_pred.astype(np.float32),
+        (base_lla[:, 0:1] / 90.0).astype(np.float32),
+        np.sin(lon_b).astype(np.float32).reshape(-1, 1),
+        np.cos(lon_b).astype(np.float32).reshape(-1, 1),
+        (base_lla[:, 2:3] / 42164.0).astype(np.float32),
+        (pred_lla[:, 0:1] / 90.0).astype(np.float32),
+        np.sin(lon_p).astype(np.float32).reshape(-1, 1),
+        np.cos(lon_p).astype(np.float32).reshape(-1, 1),
+        (pred_lla[:, 2:3] / 42164.0).astype(np.float32),
+        d_az,
+        d_el,
+        (d_lat / 5.0).astype(np.float32),
+        (d_lon / 5.0).astype(np.float32),
+        (d_alt / 20.0).astype(np.float32),
+        static.astype(np.float32),
+    ]
+    return np.concatenate(x_parts, axis=1).astype(np.float32)
+
+
+def build_lla_stage2_features(
+    x_lla_feat: np.ndarray,
+    max_base_features: int,
+    pair_features: int,
+) -> np.ndarray:
+    x = np.asarray(x_lla_feat, dtype=np.float64)
+    if x.ndim != 2 or x.shape[0] == 0:
+        return np.zeros((0, 1), dtype=np.float32)
+    q = int(max(1, min(int(max_base_features), int(x.shape[1]))))
+    base = np.asarray(x[:, :q], dtype=np.float64)
+    parts = [base, np.square(base)]
+    p = int(max(1, min(int(pair_features), q)))
+    if p >= 2:
+        pair_cols = []
+        for i in range(p):
+            for j in range(i + 1, p):
+                pair_cols.append((base[:, i] * base[:, j]).reshape(-1, 1))
+        if pair_cols:
+            parts.append(np.concatenate(pair_cols, axis=1).astype(np.float64))
+    return np.concatenate(parts, axis=1).astype(np.float32)
+
+
+def fit_linear_multi_ridge(x: np.ndarray, y: np.ndarray, ridge: float) -> dict:
+    xx = np.asarray(x, dtype=np.float64)
+    yy = np.asarray(y, dtype=np.float64)
+    if xx.ndim != 2 or yy.ndim != 2 or xx.shape[0] != yy.shape[0] or xx.shape[0] == 0:
+        raise RuntimeError("Invalid training matrix for linear ridge model")
+    x_mean = np.mean(xx, axis=0)
+    x_std = np.std(xx, axis=0)
+    x_std = np.where(x_std < 1.0e-6, 1.0, x_std)
+    xn = (xx - x_mean[None, :]) / x_std[None, :]
+    phi = np.concatenate([np.ones((xn.shape[0], 1), dtype=np.float64), xn], axis=1)
+    d = int(phi.shape[1])
+    reg = np.eye(d, dtype=np.float64) * float(max(0.0, float(ridge)))
+    reg[0, 0] = 0.0
+    a = phi.T @ phi + reg
+    b = phi.T @ yy
+    w = np.linalg.solve(a, b)
+    return {
+        "x_mean": np.asarray(x_mean, dtype=np.float64).tolist(),
+        "x_std": np.asarray(x_std, dtype=np.float64).tolist(),
+        "weights": np.asarray(w, dtype=np.float64).tolist(),
+        "feature_dim": int(xx.shape[1]),
+        "target_dim": int(yy.shape[1]),
+    }
+
+
+def predict_linear_multi_ridge(model: dict, x: np.ndarray) -> np.ndarray:
+    xx = np.asarray(x, dtype=np.float64)
+    x_mean = np.asarray(model["x_mean"], dtype=np.float64).reshape(1, -1)
+    x_std = np.asarray(model["x_std"], dtype=np.float64).reshape(1, -1)
+    w = np.asarray(model["weights"], dtype=np.float64)
+    xn = (xx - x_mean) / np.where(np.abs(x_std) < 1.0e-9, 1.0, x_std)
+    phi = np.concatenate([np.ones((xn.shape[0], 1), dtype=np.float64), xn], axis=1)
+    return np.asarray(phi @ w, dtype=np.float64)
+
+
+def apply_lla_delta_with_alpha(
+    pred_lla: np.ndarray,
+    delta_lla: np.ndarray,
+    alpha_lat: float,
+    alpha_lon: float,
+    alpha_alt: float,
+) -> np.ndarray:
+    p = np.asarray(pred_lla, dtype=np.float64)
+    d = np.asarray(delta_lla, dtype=np.float64)
+    out = np.asarray(p, dtype=np.float64).copy()
+    out[:, 0] = p[:, 0] + float(alpha_lat) * d[:, 0]
+    out[:, 1] = core.wrap180(p[:, 1] + float(alpha_lon) * d[:, 1])
+    out[:, 2] = p[:, 2] + float(alpha_alt) * d[:, 2]
+    return out
+
+
+def anchor_delta_with_warmup(
+    delta_lla: np.ndarray,
+    unix: np.ndarray,
+    teacher_force_days: float,
+    anchor_scale: float,
+) -> np.ndarray:
+    d = np.asarray(delta_lla, dtype=np.float64)
+    if d.shape[0] == 0 or float(anchor_scale) <= 0.0:
+        return d
+    warm = compute_teacher_mask(unix=np.asarray(unix, dtype=np.float64), teacher_force_days=float(teacher_force_days))
+    if not np.any(np.asarray(warm, dtype=bool)):
+        return d
+    mu = np.mean(np.asarray(d[np.asarray(warm, dtype=bool)], dtype=np.float64), axis=0)
+    return np.asarray(d - float(anchor_scale) * mu.reshape(1, -1), dtype=np.float64)
+
+
+def build_full_from_lla_azel(lla: np.ndarray, azel: np.ndarray) -> np.ndarray:
+    out = np.zeros((int(np.asarray(lla).shape[0]), 5), dtype=np.float64)
+    out[:, 0:3] = np.asarray(lla, dtype=np.float64)
+    out[:, 3:5] = np.asarray(azel, dtype=np.float64)
+    return out
+
+
 def build_cycle_repeat_prior_azel_for_episode(
     ep: Episode,
     observe_days: float,
@@ -1623,6 +1819,8 @@ def build_parser() -> argparse.ArgumentParser:
     t.add_argument("--truth-suffix", default="")
     t.add_argument("--observer-lat", type=float, default=36.3022)
     t.add_argument("--observer-lon", type=float, default=137.9031)
+    t.add_argument("--observer-alt-m", type=float, default=0.0)
+    t.add_argument("--geo-radius-km", type=float, default=42164.0)
     t.add_argument("--days", type=int, default=90)
     t.add_argument("--train-days", type=int, default=7)
     t.add_argument("--step-minutes", type=int, default=10)
@@ -1670,6 +1868,13 @@ def build_parser() -> argparse.ArgumentParser:
     t.add_argument("--lr", type=float, default=1.0e-3)
     t.add_argument("--epochs", type=int, default=30)
     t.add_argument("--batch-size", type=int, default=64)
+    t.add_argument("--enable-lla-residual-correction", type=int, choices=[0, 1], default=1)
+    t.add_argument("--lla-ridge", type=float, default=1.0e-2)
+    t.add_argument("--lla-train-sample-stride", type=int, default=10)
+    t.add_argument("--lla-max-train-files", type=int, default=0)
+    t.add_argument("--lla-max-val-files", type=int, default=0)
+    t.add_argument("--lla-alpha-grid", default="0.0,0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9,1.0")
+    t.add_argument("--lla-azel-alpha-grid", default="0.0,0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9,1.0")
     t.add_argument("--seed", type=int, default=42)
     t.add_argument("--output-dir", default=".tmp/single_tle_lstm_geo_model")
 
@@ -2301,6 +2506,298 @@ def run_train(args: argparse.Namespace) -> None:
     (out_dir / "validation_rows.json").write_text(json.dumps(val_summary, ensure_ascii=False, indent=2), encoding="utf-8")
     meta["post_blend_alpha"] = float(best_alpha)
     meta["post_cycle_alpha"] = float(best_cycle_alpha)
+    if int(args.enable_lla_residual_correction) == 1:
+        print("[lla] building residual correction samples...", flush=True)
+        lla_alpha_grid = parse_float_csv(args.lla_alpha_grid)
+        if not lla_alpha_grid:
+            lla_alpha_grid = [i / 10.0 for i in range(11)]
+        lla_azel_alpha_grid = parse_float_csv(args.lla_azel_alpha_grid)
+        if not lla_azel_alpha_grid:
+            lla_azel_alpha_grid = [i / 10.0 for i in range(11)]
+        anchor_grid = [0.0, 0.5, 1.0]
+        stage2_max_base_features = 24
+        stage2_pair_features = 8
+
+        x_train_lla, y_train_lla, _ = build_lla_residual_training_samples(
+            paths=train_files,
+            sat_name=str(args.sat_name),
+            truth_cache=truth_cache,
+            observer_lat=float(args.observer_lat),
+            observer_lon=float(args.observer_lon),
+            observer_alt_m=float(args.observer_alt_m),
+            geo_radius_km=float(args.geo_radius_km),
+            days=int(args.days),
+            train_days=int(args.train_days),
+            step_minutes=int(args.step_minutes),
+            model=model,
+            meta=meta,
+            x_mean=x_mean,
+            x_std=x_std,
+            calendar_climatology_trig=calendar_clim,
+            sample_stride=int(args.lla_train_sample_stride),
+            max_files=int(args.lla_max_train_files),
+            tag="lla-train",
+        )
+        _, _, val_packs = build_lla_residual_training_samples(
+            paths=val_files,
+            sat_name=str(args.sat_name),
+            truth_cache=truth_cache,
+            observer_lat=float(args.observer_lat),
+            observer_lon=float(args.observer_lon),
+            observer_alt_m=float(args.observer_alt_m),
+            geo_radius_km=float(args.geo_radius_km),
+            days=int(args.days),
+            train_days=int(args.train_days),
+            step_minutes=int(args.step_minutes),
+            model=model,
+            meta=meta,
+            x_mean=x_mean,
+            x_std=x_std,
+            calendar_climatology_trig=calendar_clim,
+            sample_stride=1,
+            max_files=int(args.lla_max_val_files),
+            tag="lla-val",
+        )
+        if x_train_lla.shape[0] > 0 and val_packs:
+            lla_model = fit_linear_multi_ridge(
+                x=np.asarray(x_train_lla, dtype=np.float64),
+                y=np.asarray(y_train_lla, dtype=np.float64),
+                ridge=float(args.lla_ridge),
+            )
+            d1_train = predict_linear_multi_ridge(lla_model, np.asarray(x_train_lla, dtype=np.float64))
+            y_resid_train = np.asarray(y_train_lla, dtype=np.float64) - np.asarray(d1_train, dtype=np.float64)
+            x_train_lla_stage2 = build_lla_stage2_features(
+                x_lla_feat=np.asarray(x_train_lla, dtype=np.float64),
+                max_base_features=int(stage2_max_base_features),
+                pair_features=int(stage2_pair_features),
+            )
+            lla_model_stage2 = fit_linear_multi_ridge(
+                x=np.asarray(x_train_lla_stage2, dtype=np.float64),
+                y=np.asarray(y_resid_train, dtype=np.float64),
+                ridge=float(max(1.0e-6, float(args.lla_ridge) * 3.0)),
+            )
+
+            val_delta: list[tuple[LlaResidualPack, np.ndarray, np.ndarray]] = []
+            for pack in val_packs:
+                feat = build_lla_residual_features(
+                    unix=np.asarray(pack.unix, dtype=np.float64),
+                    baseline_azel=np.asarray(pack.baseline_azel, dtype=np.float64),
+                    pred_azel=np.asarray(pack.pred_azel, dtype=np.float64),
+                    baseline_lla=np.asarray(pack.baseline_lla, dtype=np.float64),
+                    pred_lla_geo=np.asarray(pack.pred_lla_geo, dtype=np.float64),
+                    static_features=np.asarray(pack.static_features, dtype=np.float64),
+                    yearly_harmonics=int(meta.get("time_yearly_harmonics", 2)),
+                )
+                d1 = predict_linear_multi_ridge(lla_model, feat)
+                feat2 = build_lla_stage2_features(
+                    x_lla_feat=np.asarray(feat, dtype=np.float64),
+                    max_base_features=int(stage2_max_base_features),
+                    pair_features=int(stage2_pair_features),
+                )
+                d2 = predict_linear_multi_ridge(lla_model_stage2, feat2)
+                val_delta.append((pack, np.asarray(d1, dtype=np.float64), np.asarray(d2, dtype=np.float64)))
+
+            lat_errors = []
+            lon_errors = []
+            alt_errors = []
+            for a in lla_alpha_grid:
+                lat_pack_errs = []
+                lon_pack_errs = []
+                alt_pack_errs = []
+                for pack, d1, _ in val_delta:
+                    m = np.asarray(pack.forecast_mask, dtype=bool)
+                    d_tmp = np.zeros((int(d1.shape[0]), 3), dtype=np.float64)
+                    d_tmp[:, 0] = float(a) * np.asarray(d1[:, 0], dtype=np.float64)
+                    d_tmp[:, 1] = float(a) * np.asarray(d1[:, 1], dtype=np.float64)
+                    d_tmp[:, 2] = float(a) * np.asarray(d1[:, 2], dtype=np.float64)
+                    d_tmp = anchor_delta_with_warmup(
+                        delta_lla=d_tmp,
+                        unix=np.asarray(pack.unix, dtype=np.float64),
+                        teacher_force_days=float(args.train_days),
+                        anchor_scale=1.0,
+                    )
+                    lat_pred = np.asarray(pack.pred_lla_geo[:, 0] + d_tmp[:, 0], dtype=np.float64)
+                    lon_pred = np.asarray(core.wrap180(pack.pred_lla_geo[:, 1] + d_tmp[:, 1]), dtype=np.float64)
+                    alt_pred = np.asarray(pack.pred_lla_geo[:, 2] + d_tmp[:, 2], dtype=np.float64)
+                    lat_err = np.abs(lat_pred[m] - np.asarray(pack.true_lla[m, 0], dtype=np.float64))
+                    lon_err = np.abs(core.angle_diff_deg(lon_pred[m], np.asarray(pack.true_lla[m, 1], dtype=np.float64)))
+                    alt_err = np.abs(alt_pred[m] - np.asarray(pack.true_lla[m, 2], dtype=np.float64))
+                    lat_pack_errs.append(float(np.max(lat_err)))
+                    lon_pack_errs.append(float(np.max(lon_err)))
+                    alt_pack_errs.append(float(np.max(alt_err)))
+                lat_errors.append((float(a), lat_pack_errs))
+                lon_errors.append((float(a), lon_pack_errs))
+                alt_errors.append((float(a), alt_pack_errs))
+
+            best_alpha_lat = tune_single_alpha(lat_errors)
+            best_alpha_lon = tune_single_alpha(lon_errors)
+            best_alpha_alt = tune_single_alpha(alt_errors)
+
+            beta_lat_scores = []
+            beta_lon_scores = []
+            beta_alt_scores = []
+            for b in lla_alpha_grid:
+                lat_pack_errs = []
+                lon_pack_errs = []
+                alt_pack_errs = []
+                for pack, d1, d2 in val_delta:
+                    m = np.asarray(pack.forecast_mask, dtype=bool)
+                    d_tmp = np.zeros((int(d1.shape[0]), 3), dtype=np.float64)
+                    d_tmp[:, 0] = float(best_alpha_lat) * np.asarray(d1[:, 0], dtype=np.float64) + float(b) * np.asarray(d2[:, 0], dtype=np.float64)
+                    d_tmp[:, 1] = float(best_alpha_lon) * np.asarray(d1[:, 1], dtype=np.float64) + float(b) * np.asarray(d2[:, 1], dtype=np.float64)
+                    d_tmp[:, 2] = float(best_alpha_alt) * np.asarray(d1[:, 2], dtype=np.float64) + float(b) * np.asarray(d2[:, 2], dtype=np.float64)
+                    d_tmp = anchor_delta_with_warmup(
+                        delta_lla=d_tmp,
+                        unix=np.asarray(pack.unix, dtype=np.float64),
+                        teacher_force_days=float(args.train_days),
+                        anchor_scale=1.0,
+                    )
+                    lat_pred = np.asarray(pack.pred_lla_geo[:, 0] + d_tmp[:, 0], dtype=np.float64)
+                    lon_pred = np.asarray(core.wrap180(pack.pred_lla_geo[:, 1] + d_tmp[:, 1]), dtype=np.float64)
+                    alt_pred = np.asarray(pack.pred_lla_geo[:, 2] + d_tmp[:, 2], dtype=np.float64)
+                    lat_err = np.abs(lat_pred[m] - np.asarray(pack.true_lla[m, 0], dtype=np.float64))
+                    lon_err = np.abs(core.angle_diff_deg(lon_pred[m], np.asarray(pack.true_lla[m, 1], dtype=np.float64)))
+                    alt_err = np.abs(alt_pred[m] - np.asarray(pack.true_lla[m, 2], dtype=np.float64))
+                    lat_pack_errs.append(float(np.max(lat_err)))
+                    lon_pack_errs.append(float(np.max(lon_err)))
+                    alt_pack_errs.append(float(np.max(alt_err)))
+                beta_lat_scores.append((float(b), lat_pack_errs))
+                beta_lon_scores.append((float(b), lon_pack_errs))
+                beta_alt_scores.append((float(b), alt_pack_errs))
+            best_beta_lat = tune_single_alpha(beta_lat_scores)
+            best_beta_lon = tune_single_alpha(beta_lon_scores)
+            best_beta_alt = tune_single_alpha(beta_alt_scores)
+
+            anchor_scores = []
+            for ag in anchor_grid:
+                errs = []
+                for pack, d1, d2 in val_delta:
+                    m = np.asarray(pack.forecast_mask, dtype=bool)
+                    d_tmp = np.zeros((int(d1.shape[0]), 3), dtype=np.float64)
+                    d_tmp[:, 0] = float(best_alpha_lat) * np.asarray(d1[:, 0], dtype=np.float64) + float(best_beta_lat) * np.asarray(d2[:, 0], dtype=np.float64)
+                    d_tmp[:, 1] = float(best_alpha_lon) * np.asarray(d1[:, 1], dtype=np.float64) + float(best_beta_lon) * np.asarray(d2[:, 1], dtype=np.float64)
+                    d_tmp[:, 2] = float(best_alpha_alt) * np.asarray(d1[:, 2], dtype=np.float64) + float(best_beta_alt) * np.asarray(d2[:, 2], dtype=np.float64)
+                    d_tmp = anchor_delta_with_warmup(
+                        delta_lla=d_tmp,
+                        unix=np.asarray(pack.unix, dtype=np.float64),
+                        teacher_force_days=float(args.train_days),
+                        anchor_scale=float(ag),
+                    )
+                    lla_corr = apply_lla_delta_with_alpha(
+                        pred_lla=np.asarray(pack.pred_lla_geo, dtype=np.float64),
+                        delta_lla=np.asarray(d_tmp, dtype=np.float64),
+                        alpha_lat=1.0,
+                        alpha_lon=1.0,
+                        alpha_alt=1.0,
+                    )
+                    true_full = build_full_from_lla_azel(np.asarray(pack.true_lla[m], dtype=np.float64), np.asarray(pack.true_azel[m], dtype=np.float64))
+                    corr_full = build_full_from_lla_azel(np.asarray(lla_corr[m], dtype=np.float64), np.asarray(pack.pred_azel[m], dtype=np.float64))
+                    errs.append(float(core.compute_metrics_lla(true_full, corr_full)["overall"]["max_abs_error_max"]))
+                anchor_scores.append((float(ag), errs))
+            best_anchor_scale = tune_single_alpha(anchor_scores)
+
+            azel_scores = []
+            for a_azel in lla_azel_alpha_grid:
+                errs = []
+                for pack, d1, d2 in val_delta:
+                    d_tmp = np.zeros((int(d1.shape[0]), 3), dtype=np.float64)
+                    d_tmp[:, 0] = float(best_alpha_lat) * np.asarray(d1[:, 0], dtype=np.float64) + float(best_beta_lat) * np.asarray(d2[:, 0], dtype=np.float64)
+                    d_tmp[:, 1] = float(best_alpha_lon) * np.asarray(d1[:, 1], dtype=np.float64) + float(best_beta_lon) * np.asarray(d2[:, 1], dtype=np.float64)
+                    d_tmp[:, 2] = float(best_alpha_alt) * np.asarray(d1[:, 2], dtype=np.float64) + float(best_beta_alt) * np.asarray(d2[:, 2], dtype=np.float64)
+                    d_tmp = anchor_delta_with_warmup(
+                        delta_lla=d_tmp,
+                        unix=np.asarray(pack.unix, dtype=np.float64),
+                        teacher_force_days=float(args.train_days),
+                        anchor_scale=float(best_anchor_scale),
+                    )
+                    lla_corr = apply_lla_delta_with_alpha(
+                        pred_lla=np.asarray(pack.pred_lla_geo, dtype=np.float64),
+                        delta_lla=np.asarray(d_tmp, dtype=np.float64),
+                        alpha_lat=1.0,
+                        alpha_lon=1.0,
+                        alpha_alt=1.0,
+                    )
+                    if float(a_azel) > 0.0:
+                        az_from_lla = recompute_azel_from_lla_np(
+                            sat_lla=lla_corr,
+                            observer_lat=float(args.observer_lat),
+                            observer_lon=float(args.observer_lon),
+                            observer_alt_m=float(args.observer_alt_m),
+                        )
+                        az_final = blend_azel_unitvec(np.asarray(pack.pred_azel, dtype=np.float64), az_from_lla, alpha=float(a_azel))
+                    else:
+                        az_final = np.asarray(pack.pred_azel, dtype=np.float64)
+                    errs.append(float(compute_forecast_max_abs_error(pack.true_azel, az_final, pack.forecast_mask)))
+                azel_scores.append((float(a_azel), errs))
+            best_alpha_azel = tune_single_alpha(azel_scores)
+
+            base_lla_errs = []
+            corr_lla_errs = []
+            corr_azel_errs = []
+            for pack, d1, d2 in val_delta:
+                m = np.asarray(pack.forecast_mask, dtype=bool)
+                true_full = build_full_from_lla_azel(np.asarray(pack.true_lla[m], dtype=np.float64), np.asarray(pack.true_azel[m], dtype=np.float64))
+                base_full = build_full_from_lla_azel(np.asarray(pack.pred_lla_geo[m], dtype=np.float64), np.asarray(pack.pred_azel[m], dtype=np.float64))
+                base_lla_errs.append(float(core.compute_metrics_lla(true_full, base_full)["overall"]["max_abs_error_max"]))
+
+                d_tmp = np.zeros((int(d1.shape[0]), 3), dtype=np.float64)
+                d_tmp[:, 0] = float(best_alpha_lat) * np.asarray(d1[:, 0], dtype=np.float64) + float(best_beta_lat) * np.asarray(d2[:, 0], dtype=np.float64)
+                d_tmp[:, 1] = float(best_alpha_lon) * np.asarray(d1[:, 1], dtype=np.float64) + float(best_beta_lon) * np.asarray(d2[:, 1], dtype=np.float64)
+                d_tmp[:, 2] = float(best_alpha_alt) * np.asarray(d1[:, 2], dtype=np.float64) + float(best_beta_alt) * np.asarray(d2[:, 2], dtype=np.float64)
+                d_tmp = anchor_delta_with_warmup(
+                    delta_lla=d_tmp,
+                    unix=np.asarray(pack.unix, dtype=np.float64),
+                    teacher_force_days=float(args.train_days),
+                    anchor_scale=float(best_anchor_scale),
+                )
+                lla_corr = apply_lla_delta_with_alpha(
+                    pred_lla=np.asarray(pack.pred_lla_geo, dtype=np.float64),
+                    delta_lla=np.asarray(d_tmp, dtype=np.float64),
+                    alpha_lat=1.0,
+                    alpha_lon=1.0,
+                    alpha_alt=1.0,
+                )
+                if float(best_alpha_azel) > 0.0:
+                    az_from_lla = recompute_azel_from_lla_np(
+                        sat_lla=lla_corr,
+                        observer_lat=float(args.observer_lat),
+                        observer_lon=float(args.observer_lon),
+                        observer_alt_m=float(args.observer_alt_m),
+                    )
+                    az_final = blend_azel_unitvec(np.asarray(pack.pred_azel, dtype=np.float64), az_from_lla, alpha=float(best_alpha_azel))
+                else:
+                    az_final = np.asarray(pack.pred_azel, dtype=np.float64)
+                corr_full = build_full_from_lla_azel(np.asarray(lla_corr[m], dtype=np.float64), np.asarray(az_final[m], dtype=np.float64))
+                corr_lla_errs.append(float(core.compute_metrics_lla(true_full, corr_full)["overall"]["max_abs_error_max"]))
+                corr_azel_errs.append(float(core.compute_metrics_azel(true_full, corr_full)["overall"]["max_abs_error_max"]))
+
+            lla_payload = {
+                "enabled": True,
+                "ridge": float(args.lla_ridge),
+                "train_rows": int(x_train_lla.shape[0]),
+                "val_packs": int(len(val_packs)),
+                "alpha_lat": float(best_alpha_lat),
+                "alpha_lon": float(best_alpha_lon),
+                "alpha_alt": float(best_alpha_alt),
+                "beta_lat": float(best_beta_lat),
+                "beta_lon": float(best_beta_lon),
+                "beta_alt": float(best_beta_alt),
+                "alpha_azel": float(best_alpha_azel),
+                "anchor_scale": float(best_anchor_scale),
+                "stage2_max_base_features": int(stage2_max_base_features),
+                "stage2_pair_features": int(stage2_pair_features),
+                "baseline_lla_summary": summarize(base_lla_errs),
+                "corrected_lla_summary": summarize(corr_lla_errs),
+                "corrected_azel_summary": summarize(corr_azel_errs),
+                "model": lla_model,
+                "model_stage2": lla_model_stage2,
+            }
+            meta["lla_residual_correction"] = lla_payload
+            print(json.dumps({"lla_residual_correction": lla_payload["corrected_lla_summary"]}, ensure_ascii=False, indent=2), flush=True)
+        else:
+            meta["lla_residual_correction"] = {"enabled": False, "reason": "insufficient_samples"}
+            print("[lla] skip residual correction (insufficient samples)", flush=True)
+
     (out_dir / "meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
     print(json.dumps(val_summary["lstm_cycle_blended_summary"], ensure_ascii=False, indent=2))
 
@@ -2480,6 +2977,233 @@ def predict_episode_with_model(
     lstm_err = compute_forecast_max_abs_error(ep.true_azel, pred_azel, ep.forecast_mask)
     base_err = compute_forecast_max_abs_error(ep.true_azel, ep.baseline_azel, ep.forecast_mask)
     return pred_azel, float(base_err), float(lstm_err)
+
+
+def build_lla_residual_pack_from_tle(
+    tle_path: Path,
+    sat_name: str,
+    truth_cache: dict[int, tuple[np.ndarray, np.ndarray]],
+    observer_lat: float,
+    observer_lon: float,
+    observer_alt_m: float,
+    geo_radius_km: float,
+    days: int,
+    train_days: int,
+    step_minutes: int,
+    model,
+    meta: dict,
+    x_mean: np.ndarray,
+    x_std: np.ndarray,
+    calendar_climatology_trig: np.ndarray | None,
+) -> LlaResidualPack | None:
+    window = exp.build_window(
+        tle_path=tle_path,
+        days=int(days),
+        train_days=int(train_days),
+        step_minutes=int(step_minutes),
+    )
+    truth_unix, truth_full = pick_truth_window(
+        cache=truth_cache,
+        start_unix=window.start_unix,
+        end_unix=window.end_unix,
+    )
+    if truth_unix is None or truth_full is None:
+        return None
+
+    raw_azel, raw_lla = exp.propagate_tle_azel_lla_at_unix(
+        tle_path=tle_path,
+        sat_name=str(sat_name),
+        observer_lat=float(observer_lat),
+        observer_lon=float(observer_lon),
+        unix=window.unix,
+    )
+    raw_full = np.column_stack([np.asarray(raw_lla, dtype=np.float64), np.asarray(raw_azel, dtype=np.float64)])
+    base_aligned, true_aligned, unix_aligned = core.align_by_unix(window.unix, raw_full, truth_unix, truth_full)
+    forecast_mask = np.asarray(unix_aligned >= float(window.train_end_unix), dtype=bool)
+    expected_forecast = int(np.sum(np.asarray(window.unix >= float(window.train_end_unix), dtype=bool)))
+    if int(np.sum(forecast_mask)) < expected_forecast:
+        return None
+
+    ep = Episode(
+        tle_name=tle_path.name,
+        unix=np.asarray(unix_aligned, dtype=np.float64),
+        baseline_azel=np.asarray(base_aligned[:, 3:5], dtype=np.float64),
+        true_azel=np.asarray(true_aligned[:, 3:5], dtype=np.float64),
+        forecast_mask=np.asarray(forecast_mask, dtype=bool),
+        static_features=np.asarray(exp.tle_static_features(tle_path=tle_path, sat_name=str(sat_name)), dtype=np.float64),
+    )
+    pred_azel, _, _ = predict_episode_with_model(
+        model=model,
+        meta=meta,
+        x_mean=x_mean,
+        x_std=x_std,
+        ep=ep,
+        warmup_weight=float(meta["warmup_weight"]),
+        forecast_weight=float(meta["forecast_weight"]),
+        dynamic_alpha_floor=float(meta.get("dynamic_alpha_floor", 0.05)),
+        dynamic_alpha_power=float(meta.get("dynamic_alpha_power", 1.4)),
+        uncertainty_smooth=int(meta.get("uncertainty_smooth", 11)),
+        use_ruptures_alpha_seg=1 if bool(meta.get("use_ruptures_alpha_seg", False)) else 0,
+        ruptures_model=str(meta.get("ruptures_model", "rbf")),
+        ruptures_penalty=float(meta.get("ruptures_penalty", 8.0)),
+        ruptures_min_size=int(meta.get("ruptures_min_size", 24)),
+        ruptures_jump=int(meta.get("ruptures_jump", 5)),
+        predict_batch_size=int(meta.get("predict_batch_size", 128)),
+        calendar_climatology_trig=calendar_climatology_trig,
+    )
+    pred_full = build_pred_full_from_azel(
+        pred_azel=pred_azel,
+        observer_lat=float(observer_lat),
+        observer_lon=float(observer_lon),
+        observer_alt_m=float(observer_alt_m),
+        geo_radius_km=float(geo_radius_km),
+        fallback_lla=np.asarray(base_aligned[:, 0:3], dtype=np.float64),
+    )
+    return LlaResidualPack(
+        tle_name=tle_path.name,
+        unix=np.asarray(unix_aligned, dtype=np.float64),
+        baseline_azel=np.asarray(base_aligned[:, 3:5], dtype=np.float64),
+        true_azel=np.asarray(true_aligned[:, 3:5], dtype=np.float64),
+        pred_azel=np.asarray(pred_azel, dtype=np.float64),
+        baseline_lla=np.asarray(base_aligned[:, 0:3], dtype=np.float64),
+        pred_lla_geo=np.asarray(pred_full[:, 0:3], dtype=np.float64),
+        true_lla=np.asarray(true_aligned[:, 0:3], dtype=np.float64),
+        forecast_mask=np.asarray(forecast_mask, dtype=bool),
+        static_features=np.asarray(ep.static_features, dtype=np.float64),
+    )
+
+
+def build_lla_residual_training_samples(
+    paths: Sequence[Path],
+    sat_name: str,
+    truth_cache: dict[int, tuple[np.ndarray, np.ndarray]],
+    observer_lat: float,
+    observer_lon: float,
+    observer_alt_m: float,
+    geo_radius_km: float,
+    days: int,
+    train_days: int,
+    step_minutes: int,
+    model,
+    meta: dict,
+    x_mean: np.ndarray,
+    x_std: np.ndarray,
+    calendar_climatology_trig: np.ndarray | None,
+    sample_stride: int,
+    max_files: int,
+    tag: str,
+) -> tuple[np.ndarray, np.ndarray, list[LlaResidualPack]]:
+    x_list: list[np.ndarray] = []
+    y_list: list[np.ndarray] = []
+    packs: list[LlaResidualPack] = []
+    use_paths = list(paths[: int(max_files)]) if int(max_files) > 0 else list(paths)
+    stride = int(max(1, int(sample_stride)))
+    for i, p in enumerate(use_paths, start=1):
+        pack = build_lla_residual_pack_from_tle(
+            tle_path=p,
+            sat_name=str(sat_name),
+            truth_cache=truth_cache,
+            observer_lat=float(observer_lat),
+            observer_lon=float(observer_lon),
+            observer_alt_m=float(observer_alt_m),
+            geo_radius_km=float(geo_radius_km),
+            days=int(days),
+            train_days=int(train_days),
+            step_minutes=int(step_minutes),
+            model=model,
+            meta=meta,
+            x_mean=x_mean,
+            x_std=x_std,
+            calendar_climatology_trig=calendar_climatology_trig,
+        )
+        if pack is None:
+            print(f"[{tag} {i}/{len(use_paths)}] skip {p.name}", flush=True)
+            continue
+        idx = np.where(np.asarray(pack.forecast_mask, dtype=bool))[0]
+        if idx.size == 0:
+            continue
+        idx = idx[::stride]
+        feat = build_lla_residual_features(
+            unix=np.asarray(pack.unix, dtype=np.float64),
+            baseline_azel=np.asarray(pack.baseline_azel, dtype=np.float64),
+            pred_azel=np.asarray(pack.pred_azel, dtype=np.float64),
+            baseline_lla=np.asarray(pack.baseline_lla, dtype=np.float64),
+            pred_lla_geo=np.asarray(pack.pred_lla_geo, dtype=np.float64),
+            static_features=np.asarray(pack.static_features, dtype=np.float64),
+            yearly_harmonics=int(meta.get("time_yearly_harmonics", 2)),
+        )
+        y_delta = np.column_stack(
+            [
+                np.asarray(pack.true_lla[:, 0] - pack.pred_lla_geo[:, 0], dtype=np.float64),
+                np.asarray(core.angle_diff_deg(pack.true_lla[:, 1], pack.pred_lla_geo[:, 1]), dtype=np.float64),
+                np.asarray(pack.true_lla[:, 2] - pack.pred_lla_geo[:, 2], dtype=np.float64),
+            ]
+        ).astype(np.float64)
+        x_list.append(np.asarray(feat[idx], dtype=np.float32))
+        y_list.append(np.asarray(y_delta[idx], dtype=np.float32))
+        packs.append(pack)
+        print(f"[{tag} {i}/{len(use_paths)}] {p.name} rows={int(idx.size)}", flush=True)
+    if not x_list:
+        return np.zeros((0, 1), dtype=np.float32), np.zeros((0, 3), dtype=np.float32), packs
+    x_out = np.concatenate(x_list, axis=0).astype(np.float32)
+    y_out = np.concatenate(y_list, axis=0).astype(np.float32)
+    return x_out, y_out, packs
+
+
+def tune_single_alpha(errors_by_alpha: list[tuple[float, list[float]]]) -> float:
+    if not errors_by_alpha:
+        return 0.0
+    ranked = sorted(
+        errors_by_alpha,
+        key=lambda t: (
+            float(np.max(np.asarray(t[1], dtype=np.float64))) if t[1] else float("inf"),
+            float(np.mean(np.asarray(t[1], dtype=np.float64))) if t[1] else float("inf"),
+            float(t[0]),
+        ),
+    )
+    return float(ranked[0][0])
+
+
+def apply_lla_residual_correction_for_pack(
+    pack: LlaResidualPack,
+    lla_model: dict,
+    alpha_lat: float,
+    alpha_lon: float,
+    alpha_alt: float,
+    alpha_azel: float,
+    observer_lat: float,
+    observer_lon: float,
+    observer_alt_m: float,
+    yearly_harmonics: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    feat = build_lla_residual_features(
+        unix=np.asarray(pack.unix, dtype=np.float64),
+        baseline_azel=np.asarray(pack.baseline_azel, dtype=np.float64),
+        pred_azel=np.asarray(pack.pred_azel, dtype=np.float64),
+        baseline_lla=np.asarray(pack.baseline_lla, dtype=np.float64),
+        pred_lla_geo=np.asarray(pack.pred_lla_geo, dtype=np.float64),
+        static_features=np.asarray(pack.static_features, dtype=np.float64),
+        yearly_harmonics=int(yearly_harmonics),
+    )
+    d_hat = predict_linear_multi_ridge(lla_model, feat)
+    lla_corr = apply_lla_delta_with_alpha(
+        pred_lla=np.asarray(pack.pred_lla_geo, dtype=np.float64),
+        delta_lla=np.asarray(d_hat, dtype=np.float64),
+        alpha_lat=float(alpha_lat),
+        alpha_lon=float(alpha_lon),
+        alpha_alt=float(alpha_alt),
+    )
+    if float(alpha_azel) > 0.0:
+        azel_from_lla = recompute_azel_from_lla_np(
+            sat_lla=lla_corr,
+            observer_lat=float(observer_lat),
+            observer_lon=float(observer_lon),
+            observer_alt_m=float(observer_alt_m),
+        )
+        azel_final = blend_azel_unitvec(np.asarray(pack.pred_azel, dtype=np.float64), azel_from_lla, alpha=float(alpha_azel))
+    else:
+        azel_final = np.asarray(pack.pred_azel, dtype=np.float64)
+    return np.asarray(lla_corr, dtype=np.float64), np.asarray(azel_final, dtype=np.float64)
 
 
 def run_eval_dir(args: argparse.Namespace) -> None:
@@ -3587,6 +4311,75 @@ def run_predict(args: argparse.Namespace) -> None:
         geo_radius_km=float(args.geo_radius_km),
         fallback_lla=np.asarray(raw_lla, dtype=np.float64),
     )
+    lla_corr_info = None
+    lla_corr_cfg = meta.get("lla_residual_correction")
+    if isinstance(lla_corr_cfg, dict) and bool(lla_corr_cfg.get("enabled", False)) and isinstance(lla_corr_cfg.get("model"), dict):
+        try:
+            feat_lla = build_lla_residual_features(
+                unix=np.asarray(ep.unix, dtype=np.float64),
+                baseline_azel=np.asarray(ep.baseline_azel, dtype=np.float64),
+                pred_azel=np.asarray(pred_azel, dtype=np.float64),
+                baseline_lla=np.asarray(raw_lla, dtype=np.float64),
+                pred_lla_geo=np.asarray(pred_full[:, 0:3], dtype=np.float64),
+                static_features=np.asarray(ep.static_features, dtype=np.float64),
+                yearly_harmonics=int(meta.get("time_yearly_harmonics", 2)),
+            )
+            d1 = predict_linear_multi_ridge(lla_corr_cfg["model"], feat_lla)
+            d_total = np.zeros_like(np.asarray(d1, dtype=np.float64), dtype=np.float64)
+            d_total[:, 0] = float(lla_corr_cfg.get("alpha_lat", 0.0)) * np.asarray(d1[:, 0], dtype=np.float64)
+            d_total[:, 1] = float(lla_corr_cfg.get("alpha_lon", 0.0)) * np.asarray(d1[:, 1], dtype=np.float64)
+            d_total[:, 2] = float(lla_corr_cfg.get("alpha_alt", 0.0)) * np.asarray(d1[:, 2], dtype=np.float64)
+
+            if isinstance(lla_corr_cfg.get("model_stage2"), dict):
+                feat2 = build_lla_stage2_features(
+                    x_lla_feat=np.asarray(feat_lla, dtype=np.float64),
+                    max_base_features=int(lla_corr_cfg.get("stage2_max_base_features", 24)),
+                    pair_features=int(lla_corr_cfg.get("stage2_pair_features", 8)),
+                )
+                d2 = predict_linear_multi_ridge(lla_corr_cfg["model_stage2"], feat2)
+                d_total[:, 0] += float(lla_corr_cfg.get("beta_lat", 0.0)) * np.asarray(d2[:, 0], dtype=np.float64)
+                d_total[:, 1] += float(lla_corr_cfg.get("beta_lon", 0.0)) * np.asarray(d2[:, 1], dtype=np.float64)
+                d_total[:, 2] += float(lla_corr_cfg.get("beta_alt", 0.0)) * np.asarray(d2[:, 2], dtype=np.float64)
+
+            d_total = anchor_delta_with_warmup(
+                delta_lla=np.asarray(d_total, dtype=np.float64),
+                unix=np.asarray(ep.unix, dtype=np.float64),
+                teacher_force_days=float(args.train_days),
+                anchor_scale=float(lla_corr_cfg.get("anchor_scale", 0.0)),
+            )
+            lla_corr = apply_lla_delta_with_alpha(
+                pred_lla=np.asarray(pred_full[:, 0:3], dtype=np.float64),
+                delta_lla=np.asarray(d_total, dtype=np.float64),
+                alpha_lat=1.0,
+                alpha_lon=1.0,
+                alpha_alt=1.0,
+            )
+            azel_final = np.asarray(pred_azel, dtype=np.float64)
+            alpha_azel = float(lla_corr_cfg.get("alpha_azel", 0.0))
+            if alpha_azel > 0.0:
+                az_from_lla = recompute_azel_from_lla_np(
+                    sat_lla=lla_corr,
+                    observer_lat=float(args.observer_lat),
+                    observer_lon=float(args.observer_lon),
+                    observer_alt_m=float(args.observer_alt_m),
+                )
+                azel_final = blend_azel_unitvec(np.asarray(pred_azel, dtype=np.float64), az_from_lla, alpha=alpha_azel)
+            pred_full[:, 0:3] = np.asarray(lla_corr, dtype=np.float64)
+            pred_full[:, 3:5] = np.asarray(azel_final, dtype=np.float64)
+            pred_azel = np.asarray(azel_final, dtype=np.float64)
+            lla_corr_info = {
+                "enabled": True,
+                "alpha_lat": float(lla_corr_cfg.get("alpha_lat", 0.0)),
+                "alpha_lon": float(lla_corr_cfg.get("alpha_lon", 0.0)),
+                "alpha_alt": float(lla_corr_cfg.get("alpha_alt", 0.0)),
+                "beta_lat": float(lla_corr_cfg.get("beta_lat", 0.0)),
+                "beta_lon": float(lla_corr_cfg.get("beta_lon", 0.0)),
+                "beta_alt": float(lla_corr_cfg.get("beta_alt", 0.0)),
+                "alpha_azel": float(alpha_azel),
+                "anchor_scale": float(lla_corr_cfg.get("anchor_scale", 0.0)),
+            }
+        except Exception as ex:
+            lla_corr_info = {"enabled": False, "error": str(ex)}
 
     out = ROOT / str(args.output_csv)
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -3633,11 +4426,15 @@ def run_predict(args: argparse.Namespace) -> None:
             }
             if align_info is not None:
                 payload["feature_alignment"] = align_info
+            if lla_corr_info is not None:
+                payload["lla_residual_correction"] = lla_corr_info
             print(json.dumps(payload, ensure_ascii=False, indent=2))
             return
     payload = {"tle_file": tle_path.name, "output_csv": str(out)}
     if align_info is not None:
         payload["feature_alignment"] = align_info
+    if lla_corr_info is not None:
+        payload["lla_residual_correction"] = lla_corr_info
     print(json.dumps(payload, ensure_ascii=False, indent=2))
 
 

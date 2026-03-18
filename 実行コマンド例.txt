@@ -1,0 +1,202 @@
+python calc_az_el_2024.py --tle-dir 28628_2024 --out-csv 2024_calc_az_el.csv --sat-name 28628
+python calc_az_el_2023.py --tle-dir 28628_2023 --out-csv 2023_calc_az_el.csv --sat-name 28628
+
+docker run --rm -it --gpus all -v "$PWD":/work -w /work orbit-tf-pip:cuda128 bash -lc 'python3.11 orbit_predict_ai.py 2024-03-01-13-49-53.txt --retrain --epochs 1600 --batch 256 --train_select all --train_step_min 1'
+
+docker run --rm --gpus all -v "$PWD:/work" dsgp4-offline-gpu --tle /work/pred_tle/2024-02-01_17-47-26.txt --outdir /work/output --device auto
+
+docker run --rm --gpus all --entrypoint python -v "$PWD:/work" dsgp4-offline-gpu /work/dsgp4_90day_azel_compare.py --tle /work/pred_tle/2024-02-01_17-47-26.txt --truth-csv /work/2024_calc_az_el.csv --outdir /work/output --device auto --days 90 --step-minutes 1 --tolerance 0.1 --assist-mode auto
+
+docker run --rm --gpus all -v "$PWD:/work" dsgp4-blackwell-offline --tle /work/pred_tle/2024-02-01_17-47-26.txt --truth-csv /work/2024_calc_az_el.csv --outdir /work/output --device auto --days 90 --step-minutes 1 --tolerance 0.1 --assist-mode auto
+
+他衛星学習はやめてください。あくまで本衛星のデータのみで学習、正確な推論を導いてください。
+計算時間がかかる分には構わないので、一番精度が出ると考えられるパラメーターをもとに検証し、<0.1を可能な限り目指してください。学習データは2020, 2021, 2022年の三年分を使用し、バリデーションデータとしては2023年のものを使用して精度を確認してください。
+また、ruptures は Python でのオフライン変化点検出ライブラリで、様々なコストモデルやアルゴリズムが統一APIで扱えると情報がありました。PELT（Pruned Exact Linear Time）は「最適な分割を高速に計算する」手法で、外れ値や分布変化の検出に適しており、信号セグメント化や平均・分散シフトの検出でよく用いられているそうです。この手法を使用して、まぬーばの解析やドリフトの補正などが行えませんか？有用そうであれば取り入れてください。特に効果がなさそうであれば忘れてください。
+
+
+ではruptures/PELTについては忘れてください。
+学習データとなる過去データを前処理し、AZ, EL, UNIXの値をsin, cos変換して周期性を持たせた学習パラメータを増やすことで、最終的な予測値の精度は向上しますか？
+そのように前処理した過去データとして、2020_calc_az_el_sincos.csv, 2021_calc_az_el_sincos.csv, 2022_calc_az_el_sincos.csv, 2023_calc_az_el_sincos.csvという過去データファイルを用意しました。2020_calc_az_el_sincos.csv, 2021_calc_az_el_sincos.csv, 2022_calc_az_el_sincos.csvから学習し、2023年のデータをバリデーションデータとして推論結果の確認を行い、max_abs_error_max < 0.1となるように深く考えてください。
+
+追加の UNIX_sin/cos, AZ_sin/cos, EL_sin/cos 列を学習に使うようにしてください。とにかくmax_abs_error_max < 0.1となるように、今あるデータを使用して深く考えてください。
+また、今は軽いパラメータで各TLEファイルに対して推論を繰り返して0.1未満になるかを確認していると思いますが、本番では時間をかけて学習、推論を行います。なので、学習には本番相当の時間をかけて最高の精度となるモデルを作成し、推論時にも3つほどランダムにTLEをピックアップして確認するようにしてください。
+
+今の検証を終えた後、以下の内容を確認してください。
+実際に学習が困難なほど、ランダムな動きをしているのかを確認するために、plot_az_el.pyによって2022_calc_az_el.csvのAZ, ELの値を月ごと及び一年を通した期間でグラフを作成してみました。これを見ると、やはり周期及び振幅はほぼ一定を保っているように見えます。
+推論時に使用するデータは、対象のTLEデータから取得できて信頼できる三日分のデータを用いて、そこから一定の周期、振幅を繰り返すようにはできませんか？このようなほとんど一定の周期、振幅を持つデータを正確に予測する先行研究、事例は必ずあると思うのですが。詳細に深く調査し、今回のケースに当てはめて深く考えて実装し、最終的な誤差の絶対値の最大値が0.1未満になるまで繰り返し検証を行ってください。
+これから仕事で、12時間は私は帰ってこないので、その間目的を達成するまで検証を止めずに繰り返し作業してください。帰ってきたら合図します。
+
+
+
+docker run --rm -v "$PWD":/work -w /work orbit-tf-pip:cuda128 bash -lc 'python train_periodic_tf.py 2020_calc_az_el.csv 2021_calc_az_el.csv 2022_calc_az_el.csv --model-dir periodic_tf_model_multi --context-days 3 --target-days 1 --forecast-days 90 --epochs 250 --batch-size 8 --val-windows 45'
+
+
+
+orbit-tf-pip:cuda128というdockerイメージは、中にtensorflowを入れているのでGPUでtensorflowを使用できます。これを「docker run --rm --gpus all -v "$PWD:/work」のようにして使用してください。検証速度等を上げるためです。
+今まで様々な方法を長い間試してきましたが、max_abs_error_max < 0.1を満たす方針は一つもありませんでした。何が原因で、どのようにすれば目的を満たせると考えられるでしょうか？軌道計算及び周期データ予測AIエンジニアのプロフェッショナルとして、深く原因を考えて突き止めてください。
+
+
+提案された「目標を満たすために必要な条件」は、どれも私が今実現したい方針からは離れてしまいます。あくまでも過去の軌道情報を学習したモデルを用いて、直近の軌道から将来の90日分の軌道情報を正確に予測することを目的としています。
+今までで一番精度が期待できそうだったのは、single_tle_lstm_geo_predictor.pyでした。
+このプログラムの方針を基準にして、より精度が高められるように深く考えてください。まず、予測対象をAZ, ELだけでなく、Lat, Lon, Altも予測し、AZ, ELと同様に真値との差をplotするように修正してください。
+
+
+docker run --rm --gpus all -v "$PWD":/work -w /work orbit-tf-pip:cuda128 bash -lc 'python3.11 single_tle_lstm_geo_predictor.py predict --model-dir ./single_tle_lstm_geo_2020_2022_td7_periodic_s120_v1_retrain --tle-file pred_tle/2024-01-01_15-37-45.txt --days 90 --train-days 7 --step-minutes 1 --observer-lat 36.3022 --observer-lon 137.9031 --observer-alt-m 0.0 --geo-radius-km 42164.0 --truth-years 2024 --output-csv ./pred_single_tle_with_lla.csv'
+
+
+  docker run --rm --gpus all -v "$PWD":/work -w /work orbit-tf-pip:cuda128 bash -lc '
+  python3.11 single_tle_lstm_geo_predictor.py train \
+    --sat-name 23467 \
+    --train-years 2020,2021,2022 \
+    --val-years 2023 \
+    --observer-lat 36.3022 \
+    --observer-lon 137.9031 \
+    --days 90 \
+    --train-days 7 \
+    --step-minutes 1 \
+    --seq-len 240 \
+    --seq-stride 120 \
+    --predict-batch-size 128 \
+    --time-feature-mode periodic \
+    --time-yearly-harmonics 2 \
+    --use-extra-sincos-features 1 \
+    --use-calendar-climatology 1 \
+    --use-cycle-repeat-prior 1 \
+    --add-baseline-periodic-harmonics 2 \
+    --pseudo-observe-days 3.0 \
+    --teacher-force-days 3.0 \
+    --periodic-ls-harmonics 2 \
+    --warmup-weight 0.2 \
+    --forecast-weight 1.0 \
+    --lstm-units-1 96 \
+    --lstm-units-2 48 \
+    --dense-units 32 \
+    --dropout 0.1 \
+    --delta-scale 0.35 \
+    --loss-angle-weight 0.1 \
+    --loss-softmax-weight 0.1 \
+    --loss-softmax-temp 6.0 \
+    --loss-worstk-weight 0.2 \
+    --loss-worstk-frac 0.08 \
+    --loss-uncertainty-weight 0.05 \
+    --uncertainty-target-scale 0.08 \
+    --dynamic-alpha-floor 0.01 \
+    --dynamic-alpha-power 1.8 \
+    --uncertainty-smooth 11 \
+    --use-ruptures-alpha-seg 0 \
+    --ruptures-model rbf \
+    --ruptures-penalty 8.0 \
+    --ruptures-min-size 24 \
+    --ruptures-jump 5 \
+    --lr 1e-3 \
+    --epochs 30 \
+    --batch-size 64 \
+    --seed 42 \
+    --output-dir ./single_tle_lstm_geo_2020_2022_td7_periodic_s120_v1_retrain
+  '
+
+  時間をかける本番学習にするなら、まずは --epochs 6 を --epochs 30 に上げてください。
+
+推論したLat, Lon, AltからさらにAZ, ELを改めて計算し、真値との比較、plotを行うスクリプトを作成してください。
+
+single_tle_lstm_geo_predictor.pyについて、この方針をもとに、特にLat, Lon, Altについて（できればAZ. ELも）さらに精度を上げる修正を、軌道計算及びAIエンジニアのプロフェッショナルとして深く考えて実施してください。修正後のスクリプトは別名で保存してください。
+
+• 別名で実装しました。
+  新スクリプト: single_tle_lstm_geo_predictor_lla_plus.py
+
+  主な強化点です。
+
+  - AZ/EL予測後に、LLA残差補正モデル（線形Ridge, 学習ベース）を追加し、Lat/Lon/Altを補正
+      - 実装: single_tle_lstm_geo_predictor_lla_plus.py:1388, single_tle_lstm_geo_predictor_lla_plus.py:1441
+  - 補正後LLAからAZ/ELを再計算し、必要ならブレンドしてAZ/ELも改善可能に
+      - 実装: single_tle_lstm_geo_predictor_lla_plus.py:1355
+  - trainでLLA補正モデルを追加学習し、meta.jsonに保存。predictで自動適用
+      - 実装: single_tle_lstm_geo_predictor_lla_plus.py:2471, single_tle_lstm_geo_predictor_lla_plus.py:4155
+  - 新オプション追加（train）
+      - --enable-lla-residual-correction, --lla-ridge, --lla-train-sample-stride, --lla-alpha-grid, --lla-azel-alpha-grid
+      - 追加位置: single_tle_lstm_geo_predictor_lla_plus.py:1833
+
+  学習コマンド例（本番向け）:
+
+  docker run --rm --gpus all -v "$PWD":/work -w /work orbit-tf-pip:cuda128 bash -lc '
+  python3.11 single_tle_lstm_geo_predictor_lla_plus.py train \
+    --sat-name 23467 \
+    --train-years 2020,2021,2022 \
+    --val-years 2023 \
+    --observer-lat 36.3022 \
+    --observer-lon 137.9031 \
+    --observer-alt-m 0.0 \
+    --geo-radius-km 42164.0 \
+    --days 90 --train-days 7 --step-minutes 1 \
+    --seq-len 240 --seq-stride 120 \
+    --epochs 30 --batch-size 64 \
+    --enable-lla-residual-correction 1 \
+    --lla-ridge 1e-2 \
+    --lla-train-sample-stride 10 \
+    --output-dir .tmp/single_tle_lstm_geo_lla_plus_2020_2022
+  '
+
+  推論コマンド例:
+
+  docker run --rm --gpus all -v "$PWD":/work -w /work orbit-tf-pip:cuda128 bash -lc '
+  python3.11 single_tle_lstm_geo_predictor_lla_plus.py predict \
+    --model-dir .tmp/single_tle_lstm_geo_lla_plus_2020_2022 \
+    --tle-file pred_tle/2024-01-01_15-37-45.txt \
+    --days 90 --train-days 7 --step-minutes 1 \
+    --observer-lat 36.3022 --observer-lon 137.9031 --observer-alt-m 0.0 \
+    --geo-radius-km 42164.0 \
+    --truth-years 2024 \
+    --output-csv .tmp/pred_single_tle_lla_plus.csv
+  '
+
+  補足: 既存の旧モデルでもこの新スクリプトで推論は可能ですが、その場合は meta.json にLLA補正モデルが無いため補正は自動スキップされます。
+
+
+• 新規スクリプトを作成しました。
+  eval_recomputed_azel_from_pred_lla.py
+
+  このスクリプトは、pred CSV の Lat/Lon/Alt から AZ/EL を再計算し、truth と整列して比較・誤差評価・plot出力まで行いま
+  eval_recomputed_azel_from_pred_lla.py:279
+
+  実行例:
+    --pred-csv ./pred_single_tle_with_lla.csv \
+    --truth-file 2024_calc_az_el.csv \
+    --observer-lat 36.3022 \
+    --observer-lon 137.9031 \
+    --observer-alt-m 0.0 \
+    --train-days 7 \
+    --output-dir ./.tmp/recomputed_azel_eval
+  '
+
+  出力は summary.json, aligned_recomputed_azel_vs_truth.csv, recomputed_vs_truth_compare.png,
+  recomputed_vs_truth_error.png です。
+  ローカルでスモーク実行し、正常に出力されることを確認済みです。
+
+docker run --rm --gpus all -v "$PWD":/work -w /work orbit-tf-pip:cuda128 bash -lc 'python3.11 eval_recomputed_azel_from_pred_lla.py --pred-csv ./pred_single_tle_with_lla.csv --truth-file 2024_calc_az_el.csv --observer-lat 36.3022 --observer-lon 137.9031 --observer-alt-m 0.0 --train-days 7 --output-dir ./recomputed_azel_eval'
+
+• 改善版を別名で保存しました。
+
+  今回の強化内容は、Lat/Lon/Alt 精度を主目的にしつつ AZ/EL も連動で改善する構成です。
+
+  - 2段のLLA残差補正を導入
+    1段目: 線形Ridge、2段目: 非線形（2次＋交差項）Ridge
+    single_tle_lstm_geo_predictor_lla_plus_v2.py:1441
+  - 予測時のドリフト抑制として、ウォームアップ期間平均を差し引くアンカー補正を追加
+    single_tle_lstm_geo_predictor_lla_plus_v2.py:1514
+  - 学習時に alpha_lat/lon/alt に加え beta_lat/lon/alt（2段目寄与）、anchor_scale、alpha_azel を検証して最適化し、meta.json に保存
+    single_tle_lstm_geo_predictor_lla_plus_v2.py:2574
+  - 推論時に保存済み model_stage2 と anchor_scale を自動適用
+    single_tle_lstm_geo_predictor_lla_plus_v2.py:4188
+
+  追加オプション（train）:
+
+  - --enable-lla-residual-correction
+  - --lla-ridge
+  - --lla-train-sample-stride
+  - --lla-alpha-grid
+  - --lla-azel-alpha-grid
+    single_tle_lstm_geo_predictor_lla_plus_v2.py:1871
+
+  動作確認は実施済みです（Docker内で train と predict のスモーク完了）。
+  次はこの v2 で本番条件（2020-2022学習/2023検証、1分刻み、90日）を回して、meta の最適係数を固定して全TLE評価へ進めます。
+
